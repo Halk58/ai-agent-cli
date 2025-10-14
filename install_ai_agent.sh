@@ -61,11 +61,7 @@ if [ -n "$UPDATE_URL" ]; then
         cleanup_update_tmp() { rm -f "$tmp_update_file"; }
         trap cleanup_update_tmp EXIT
         if curl -fsSL "$UPDATE_URL" -o "$tmp_update_file"; then
-            remote_version="$(grep -Eo 'SCRIPT_VERSION=\"[0-9.]+'\"\"'\"'\"'\" | head -n1 | cut -d'"' -f2)"
-            if [ -z "$remote_version" ]; then
-                # fallback extraction (more tolerant)
-                remote_version="$(grep -Eo 'SCRIPT_VERSION=\"[0-9.]+\"' "$tmp_update_file" | head -n1 | cut -d'"' -f2)"
-            fi
+            remote_version="$(grep -Eo 'SCRIPT_VERSION="[0-9.]+"' "$tmp_update_file" | head -n1 | cut -d'"' -f2)"
             if [ -n "$remote_version" ]; then
                 newest_version="$(printf '%s\n%s' "$SCRIPT_VERSION" "$remote_version" | sort -V | tail -n1)"
                 if [ "$newest_version" = "$remote_version" ] && [ "$SCRIPT_VERSION" != "$remote_version" ]; then
