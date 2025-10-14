@@ -36,7 +36,7 @@ SCRIPT_VERSION="1.1.0"
 # Set UPDATE_URL to the address of the latest install script.  Leave empty to disable auto-update.
 # Example:
 # UPDATE_URL="https://example.com/install_ai_agent.sh"
-UPDATE_URL=""
+UPDATE_URL="https://raw.githubusercontent.com/Halk58/ai-agent-cli/main/install_ai_agent.sh"
 
 # Determine whether sudo is available.  Some minimal containers do not have sudo installed.
 if command -v sudo >/dev/null 2>&1; then
