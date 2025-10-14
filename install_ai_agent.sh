@@ -15,54 +15,74 @@
 #
 set -euo pipefail
 
+# ===== Pre-flight: require root or sudo =====
+if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
+  echo "[ERROR] Necesitas ser root o tener sudo instalado." >&2
+  exit 1
+fi
+
+# ===== Lock to avoid concurrent installs =====
+LOCK_FILE="/tmp/ai-agent.install.lock"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK_FILE" || true
+  if ! flock -n 9; then
+    echo "[ERROR] Otra instalación está en curso. Aborto."
+    exit 1
+  fi
+fi
+
 # Versioning and update mechanism
-#
-# The following variables control the auto‑update behaviour of this script.  You can
-# modify `SCRIPT_VERSION` to reflect the current version and set `UPDATE_URL` to
-# point to a remote location where the latest version of this script is hosted.
-# When this script starts it will attempt to download the remote script and
-# compare its version to the local `SCRIPT_VERSION`.  If the remote version is
-# newer, the script will replace itself and re‑execute using the updated copy.
-SCRIPT_VERSION="1.0.0"
-# Set UPDATE_URL to the address of the latest install script.  Leave empty to
-# disable auto‑update.  Example:
+SCRIPT_VERSION="1.1.0"
+# Set UPDATE_URL to the address of the latest install script.  Leave empty to disable auto-update.
+# Example:
 # UPDATE_URL="https://example.com/install_ai_agent.sh"
 UPDATE_URL=""
 
-# Determine whether sudo is available.  Some minimal containers do not have sudo
-# installed.  If sudo is missing, fall back to running commands directly.
+# Determine whether sudo is available.  Some minimal containers do not have sudo installed.
 if command -v sudo >/dev/null 2>&1; then
     SUDO="sudo"
 else
     SUDO=""
 fi
 
-# Auto‑update: fetch the script at UPDATE_URL and compare versions
+# Distro check (warn only)
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  if [ "${ID:-}" != "debian" ] || [ "${VERSION_ID:-}" != "12" ]; then
+    echo "[WARN] Script pensado para Debian 12; detectado ${ID:-?} ${VERSION_ID:-?}."
+  fi
+fi
+
+# Auto-update: fetch the script at UPDATE_URL and compare versions
 if [ -n "$UPDATE_URL" ]; then
-    tmp_update_file="$(mktemp)"
-    if curl -fsSL "$UPDATE_URL" -o "$tmp_update_file"; then
-        # Extract remote version from the downloaded file
-        remote_version="$(grep -Eo 'SCRIPT_VERSION="[0-9.]+"' "$tmp_update_file" | head -n1 | cut -d'"' -f2)"
-        if [ -n "$remote_version" ]; then
-            # Determine which version is newer using sort -V
-            newest_version="$(printf '%s\n%s' "$SCRIPT_VERSION" "$remote_version" | sort -V | tail -n1)"
-            if [ "$newest_version" = "$remote_version" ] && [ "$SCRIPT_VERSION" != "$remote_version" ]; then
-                echo "[INFO] A newer version ($remote_version) is available at $UPDATE_URL. Updating..."
-                script_path="$(readlink -f -- "$0")"
-                # Replace the current script with the downloaded one. Use sudo if needed.
-                if [ -w "$script_path" ]; then
-                    cp "$tmp_update_file" "$script_path"
-                else
-                    ${SUDO} cp "$tmp_update_file" "$script_path"
-                fi
-                chmod +x "$script_path"
-                echo "[INFO] Executing the updated script..."
-                exec "$script_path" "$@"
+    if command -v curl >/dev/null 2>&1; then
+        tmp_update_file="$(mktemp)"
+        # ensure cleanup
+        cleanup_update_tmp() { rm -f "$tmp_update_file"; }
+        trap cleanup_update_tmp EXIT
+        if curl -fsSL "$UPDATE_URL" -o "$tmp_update_file"; then
+            remote_version="$(grep -Eo 'SCRIPT_VERSION=\"[0-9.]+'\"\"'\"'\"'\" | head -n1 | cut -d'"' -f2)"
+            if [ -z "$remote_version" ]; then
+                # fallback extraction (more tolerant)
+                remote_version="$(grep -Eo 'SCRIPT_VERSION=\"[0-9.]+\"' "$tmp_update_file" | head -n1 | cut -d'"' -f2)"
             fi
+            if [ -n "$remote_version" ]; then
+                newest_version="$(printf '%s\n%s' "$SCRIPT_VERSION" "$remote_version" | sort -V | tail -n1)"
+                if [ "$newest_version" = "$remote_version" ] && [ "$SCRIPT_VERSION" != "$remote_version" ]; then
+                    echo "[INFO] A newer version ($remote_version) is available at $UPDATE_URL. Updating..."
+                    script_path="$(readlink -f -- "$0")"
+                    # Atomic replace with correct mode
+                    ${SUDO} install -m 755 "$tmp_update_file" "$script_path"
+                    echo "[INFO] Executing the updated script..."
+                    exec "$script_path" "$@"
+                fi
+            fi
+        else
+            echo "[WARN] Unable to check for updates at $UPDATE_URL. Proceeding with current version."
         fi
-        rm -f "$tmp_update_file"
+        # tmp file auto-cleaned by trap
     else
-        echo "[WARN] Unable to check for updates at $UPDATE_URL. Proceeding with current version."
+        echo "[WARN] UPDATE_URL definido pero 'curl' no está disponible; omito auto-actualización."
     fi
 fi
 
@@ -88,41 +108,19 @@ ai_server_agent.py - Automate server tasks on Debian using OpenAI's API
 
 This script implements a simple autonomous agent that runs on a Debian‑based server
 and uses an OpenAI model to translate natural‑language requests into shell
-commands.  The agent follows a loop: it asks the language model for the next
-command(s) to run, executes them, captures their output, and feeds the output
-back into the conversation.  The cycle repeats until the model signals that
-the task is complete.
+commands. The agent asks the model for commands, executes them, returns output,
+and repeats until the model sets `finished=true`.
 
-Features:
-  • Supports multi‑step tasks – the model can refine its plan after seeing
-    command output and issue additional commands until the goal is reached.
-  • Executes commands safely using the system shell and returns stdout/stderr
-    to the model.
-  • Uses the OpenAI Chat Completions API with JSON mode to ensure the model
-    returns structured data.  The agent enforces strict JSON and handles
-    parsing errors gracefully.
-  • Contains simple safeguards to prevent obviously destructive commands.
-
-Usage:
-  python3 ai_server_agent.py --task "install nginx and start it"
-
-You must set an environment variable called OPENAI_API_KEY with your OpenAI
-API key before running this script.  On first run you may also specify
-`--model` to choose a particular model (default: gpt‑4o).  See the README
-or comments in this file for further details.
-
-WARNING: Running shell commands generated by an AI model can be dangerous.
-Always review commands and run this software on non‑critical systems or
-containers.  The `ai‑shell‑agent` package warns that AI can "generate wrong
-and possibly destructive commands" and advises users to be mindful of
-dangerous operations【114342969493772†L211-L213】.  While this agent includes
-basic safety checks, it does not guarantee complete protection against
-harmful commands.  Use at your own risk.
+Safety notes:
+- Running shell commands generated by an AI model can be dangerous.
+- This agent includes basic safeguards but does NOT guarantee full protection.
+- Use on non-critical systems. You are responsible for reviewing behaviour.
 """
 
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -130,197 +128,171 @@ import time
 from typing import Any, Dict, List, Tuple
 
 try:
-    import openai  # type: ignore
+    from openai import OpenAI  # modern SDK
 except ImportError:
-    print("The 'openai' package is not installed. Please install it with 'pip install openai'", file=sys.stderr)
+    print("La librería 'openai' no está instalada. Instálala con: pip install 'openai>=1.40,<2'", file=sys.stderr)
     sys.exit(1)
 
 
-def run_shell_command(command: str) -> Tuple[int, str, str]:
-    """Run a shell command and return (returncode, stdout, stderr).
-
-    The command is executed with `shell=True` so that compound commands work.
-    A timeout is not enforced here; long‑running commands will block until
-    completion.  You may wish to extend this to include timeouts or resource
-    limits.
-    """
+def run_shell_command(command: str, timeout: int = 600) -> Tuple[int, str, str]:
+    """Run a shell command with a timeout and sane environment; return (rc, stdout, stderr)."""
+    env = os.environ.copy()
+    env.setdefault("DEBIAN_FRONTEND", "noninteractive")
+    env.setdefault("LC_ALL", "C.UTF-8")
+    env.setdefault("LANG", "C.UTF-8")
     try:
-        proc = subprocess.run(command, shell=True, capture_output=True, text=True)
+        proc = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
         return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as e:
+        return 124, (e.stdout or ""), (e.stderr or f"Timeout tras {timeout}s")
     except Exception as e:
-        # In case the subprocess module raises unexpected exceptions
         return 1, "", str(e)
 
 
+# Hardened dangerous command detection using regex
+DANGEROUS_PATTERNS = [
+    re.compile(r'\brm\s+(?:-[^\s]*f[^\s]*r|-[^\s]*r[^\s]*f|--no-preserve-root)\b.*?(?:/\s*(?:$|\*|\s))', re.I),
+    re.compile(r'\brm\s+-rf\s+/\b', re.I),
+    re.compile(r'\bmkfs(?:\.|\s)', re.I),
+    re.compile(r'\bwipefs\b', re.I),
+    re.compile(r'\bdd\s+of=/dev/(?:sd|vd|nvme|mapper)/', re.I),
+    re.compile(r'\b(?:parted|sfdisk|fdisk)\b', re.I),
+    re.compile(r'\b(?:shutdown|reboot|halt)\b', re.I),
+    re.compile(r':\(\)\s*{\s*:\|:&\s*};:', re.I),  # fork bomb
+]
+
 def is_dangerous_command(cmd: str) -> bool:
-    """Simple heuristic to block obviously destructive commands.
-
-    Returns True if the command appears to be inherently dangerous.  This
-    check is intentionally conservative – it blocks patterns like 'rm -rf /',
-    shutdown/reboot, and formatting commands.  You should extend this list to
-    reflect your threat model.
-    """
-    dangerous_patterns = [
-        "rm -rf /",
-        "rm -rf\"",
-        "mkfs",
-        "dd if=",
-        "shutdown",
-        "reboot",
-        "halt",
-        ":(){ :|:& };:",  # fork bomb
-    ]
-    lower = cmd.lower().strip()
-    for pattern in dangerous_patterns:
-        if pattern in lower:
-            return True
-    return False
+    s = cmd.strip().lower()
+    return any(p.search(s) for p in DANGEROUS_PATTERNS)
 
 
-def call_openai_chat(messages: List[Dict[str, str]], model: str) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Call the OpenAI Chat Completion API and return parsed JSON content and token usage.
-
-    The API is called in JSON mode.  Some experimental models (for example
-    certain mini variants) do not allow overriding the temperature.  In such
-    cases the call is retried without specifying a temperature, which causes
-    the model to use its default.  The second return value is a dictionary
-    containing token usage metadata (prompt and completion tokens) when
-    available.
-    """
-    try:
-        # First attempt with temperature=0 for deterministic behaviour
-        response = openai.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.0,
-            response_format={"type": "json_object"},
-        )
-    except Exception as exc:
-        msg = str(exc)
-        # If the error indicates temperature is unsupported, retry without it
-        if "temperature" in msg.lower() and "unsupported" in msg.lower():
-            try:
-                response = openai.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                )
-            except Exception:
-                raise RuntimeError(f"OpenAI API call failed: {exc}") from exc
-        else:
-            raise RuntimeError(f"OpenAI API call failed: {exc}") from exc
-    content = response.choices[0].message.content
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Model output is not valid JSON: {e}\nRaw content:\n{content}") from e
-    usage = getattr(response, "usage", None)
-    if usage:
-        usage_dict = {
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-        }
-    else:
-        usage_dict = {"prompt_tokens": 0, "completion_tokens": 0}
-    return data, usage_dict
+def clip(text: str, limit: int = 8000) -> str:
+    """Clip long text to avoid huge prompts."""
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    head, tail = text[:4000], text[-2000:]
+    return f"{head}\n...<clipped {len(text)-6000} chars>...\n{tail}"
 
 
 def build_system_prompt() -> str:
-    """Return the system prompt used to instruct the language model.
-
-    The prompt explains the agent's role and defines the JSON structure for
-    responses.  It uses a Reason‑and‑Act (ReACT) style where the model must
-    reason step‑by‑step, choose commands to run, and set the 'finished'
-    flag when the task is complete.
-    """
+    """System prompt defining JSON schema and behaviour."""
     return (
         "You are a server automation agent running on a Debian 12 Linux system.\n"
-        "Your job is to take high‑level instructions from the user and translate them\n"
-        "into a sequence of shell commands that achieve the user's goals.  After each\n"
-        "command is executed you will receive its output.  Use that output to decide\n"
-        "what to do next.  Continue until the overall task is complete.\n"
+        "Translate user instructions into a sequence of safe, Debian-friendly shell commands.\n"
+        "After each execution you will receive the output to decide next actions.\n"
         "\n"
-        "Follow this protocol:\n"
-        "1. Think step by step about what needs to happen next.\n"
-        "2. Respond **only** with a JSON object.  The JSON must have these keys:\n"
-        "   - commands: an array of one or more shell commands to run next.\n"
-        "   - explanation: a short explanation of what these commands do.  Keep it concise.\n"
-        "   - finished: a boolean that is true when the overall task has been completed;\n"
-        "     otherwise false.\n"
-        "3. Do not wrap the JSON in markdown or text.  The client will parse it\n"
-        "   programmatically.\n"
-        "4. Use Debian‑friendly commands and avoid interactive flags when possible.\n"
-        "5. Never propose dangerous or destructive operations (e.g. do not use\n"
-        "   'rm -rf /', 'shutdown', 'reboot', 'mkfs', 'dd', etc.).\n"
-        "6. If a command fails, do not repeat exactly the same command.\n"
-        "   Instead, analyse the error and suggest a different approach or explain\n"
-        "   why the task cannot be completed.\n"
-        "7. When finished, set finished=true and summarise in the explanation what was done."
+        "Respond ONLY with strict JSON using this schema:\n"
+        "{\n"
+        '  "commands": ["<cmd1>", "<cmd2>", ...],\n'
+        '  "explanation": "<short explanation>",\n'
+        '  "finished": true|false\n'
+        "}\n"
+        "Rules:\n"
+        "- Avoid destructive operations ('rm -rf /', shutdown, mkfs, dd, etc.).\n"
+        "- Prefer non-interactive flags.\n"
+        "- If a command failed previously, propose an alternative.\n"
+        "- When done, set finished=true and summarise briefly in 'explanation'.\n"
+        "- No markdown, no text outside of the JSON object."
     )
+
+
+def call_openai_chat(messages: List[Dict[str, str]], model: str) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Call OpenAI chat completions in JSON mode; retry once to repair JSON if needed."""
+    client = OpenAI()  # uses OPENAI_API_KEY from env
+    def _call(msgs, with_temp=True):
+        params = dict(model=model, messages=msgs, response_format={"type": "json_object"})
+        if with_temp:
+            params["temperature"] = 0.0
+        return client.chat.completions.create(**params)
+
+    # First attempt (temperature=0 for determinism)
+    try:
+        resp = _call(messages, with_temp=True)
+    except Exception as exc:
+        # Retry without temperature if model rejects it
+        try:
+            resp = _call(messages, with_temp=False)
+        except Exception:
+            raise RuntimeError(f"OpenAI API call failed: {exc}") from exc
+
+    content = resp.choices[0].message.content
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        # JSON repair attempt: add a user message asking for strict JSON and retry once
+        repair_prompt = (
+            "Your previous response was not valid JSON. "
+            "Return ONLY a valid JSON object that strictly follows the schema "
+            '{"commands": ["..."], "explanation": "...", "finished": true|false} with no extra text.'
+        )
+        repaired_msgs = messages + [{"role": "user", "content": repair_prompt}]
+        resp2 = _call(repaired_msgs, with_temp=False)
+        content2 = resp2.choices[0].message.content
+        try:
+            data = json.loads(content2)
+            resp = resp2
+        except json.JSONDecodeError as e2:
+            raise ValueError(f"Model output is not valid JSON after repair attempt:\n{content2}") from e2
+
+    usage = getattr(resp, "usage", None)
+    usage_dict = {
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+        "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+    }
+    return data, usage_dict
+
+
+def log(msg: str, log_file: str = "") -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    if log_file:
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
 
 def main() -> None:
-    """Entry point for the CLI.  Supports interactive sessions.
-
-    On launch this function parses command‑line arguments and prepares the
-    conversation with the system prompt.  It then enters a loop: for each
-    task provided by the user (either via --task or interactively) it
-    delegates to the language model to propose commands, executes them,
-    collects the outputs, and feeds them back to the model.  After each
-    task completes (or the maximum number of reasoning steps is reached)
-    the user is invited to enter another instruction.  The conversation
-    context (messages) persists across tasks so that follow‑up requests
-    can build on previous results.
-    """
     parser = argparse.ArgumentParser(
-        description=(
-            "Autonomous server agent that uses OpenAI's API to convert natural\n"
-            "language tasks into shell commands and executes them on a Debian system."
-        )
+        description=("Autonomous server agent: turns natural language into shell commands on Debian.")
     )
-    parser.add_argument(
-        "--task",
-        type=str,
-        help="Initial natural language instruction describing what you want the agent to do.",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="gpt-4o",
-        help="OpenAI model to use (default: gpt-4o).",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=10,
-        help="Maximum number of reasoning cycles per task before stopping (to prevent infinite loops).",
-    )
+    parser.add_argument("--task", type=str, help="Initial instruction for the agent.")
+    parser.add_argument("--model", type=str, default="gpt-4o", help="OpenAI model to use (default: gpt-4o).")
+    parser.add_argument("--max-steps", type=int, default=10, help="Max reasoning cycles per task.")
+    parser.add_argument("--max-commands-per-step", type=int, default=5, help="Max commands to execute per step.")
+    parser.add_argument("--timeout", type=int, default=600, help="Per-command timeout in seconds.")
+    parser.add_argument("--dry-run", action="store_true", help="Print commands but do not execute them.")
+    parser.add_argument("--confirm", action="store_true", help="Ask for confirmation before executing each command.")
+    parser.add_argument("--log-file", type=str, default="", help="Optional log file path.")
     args = parser.parse_args()
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print(
-            "Error: OPENAI_API_KEY environment variable is not set.  Please set your API key.",
-            file=sys.stderr,
-        )
+        print("Error: OPENAI_API_KEY no está definida. Exporta tu clave antes de ejecutar.", file=sys.stderr)
         sys.exit(1)
-    openai.api_key = api_key
 
-    # Initialize the conversation once with the system prompt
     messages: List[Dict[str, str]] = []
-    system_prompt = build_system_prompt()
-    messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "system", "content": build_system_prompt()})
 
-    # Track token usage across the entire session to estimate cost
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    # Use Optional type for compatibility with Python <3.10
     from typing import Optional
     pending_task: Optional[str] = args.task if args.task else None
 
     while True:
-        # Acquire the next task from the user
+        # Get next task
         if pending_task is not None:
             user_task = pending_task.strip()
             pending_task = None
@@ -330,22 +302,19 @@ def main() -> None:
             except KeyboardInterrupt:
                 print("\nOperation cancelled by user.")
                 break
-            # Exit if the user provides an empty string or explicit exit commands
             if not user_task or user_task.lower() in {"exit", "quit", "q"}:
                 print("Exiting interactive session.")
                 break
         if not user_task:
             print("No task provided. Skipping.")
             continue
-        # Append the user's instruction to the conversation history
+
         messages.append({"role": "user", "content": user_task})
 
-        # Reset per-task tracking of failed commands
         failed_commands_count: Dict[str, int] = {}
         command_errors: Dict[str, str] = {}
         finished = False
 
-        # Reasoning loop per task
         for step_num in range(1, args.max_steps + 1):
             try:
                 data, usage = call_openai_chat(messages, args.model)
@@ -355,18 +324,25 @@ def main() -> None:
                 break
             total_prompt_tokens += usage.get("prompt_tokens", 0)
             total_completion_tokens += usage.get("completion_tokens", 0)
+
             if not isinstance(data, dict) or not all(k in data for k in ("commands", "explanation", "finished")):
                 print("Model returned an unexpected JSON structure:", data, file=sys.stderr)
                 finished = True
                 break
+
             commands = data.get("commands", [])
             explanation = data.get("explanation", "")
             finished_flag = data.get("finished", False)
-            # Validate commands list
+
             if not isinstance(commands, list) or not all(isinstance(c, str) for c in commands):
                 print("'commands' must be a list of strings. Received:", commands, file=sys.stderr)
                 finished = True
                 break
+
+            if len(commands) > args.max_commands_per_step:
+                log(f"Limiting commands from {len(commands)} to {args.max_commands_per_step}", args.log_file)
+                commands = commands[: args.max_commands_per_step]
+
             print(f"\n=== Step {step_num} ===")
             print(f"AI explanation: {explanation}")
             if commands:
@@ -390,6 +366,7 @@ def main() -> None:
                     messages.append({"role": "user", "content": msg})
                     skip_remaining = True
                     break
+
                 if is_dangerous_command(cmd):
                     msg = f"Blocked dangerous command: {cmd}"
                     print(msg)
@@ -397,39 +374,58 @@ def main() -> None:
                     messages.append({"role": "user", "content": msg})
                     skip_remaining = True
                     break
+
+                # Confirmation / dry-run
+                if args.confirm:
+                    ans = input(f"¿Ejecutar el comando {idx}/{len(commands)}? [y/N]: ").strip().lower()
+                    if ans not in {"y", "yes", "s", "si", "sí"}:
+                        print("Saltando comando por confirmación del usuario.")
+                        continue
+
+                if args.dry_run:
+                    print(f"[dry-run] Simulando ejecución: {cmd}")
+                    messages.append({"role": "assistant", "content": json.dumps(data)})
+                    sim_output = f"Command (dry-run): {cmd}\nReturn code: 0\nSTDOUT:\n\nSTDERR:\n"
+                    messages.append({"role": "user", "content": sim_output})
+                    continue
+
                 print(f"\nExecuting command {idx}/{len(commands)}: {cmd}")
-                returncode, stdout, stderr = run_shell_command(cmd)
+                rc, stdout, stderr = run_shell_command(cmd, timeout=args.timeout)
                 if stdout:
                     print("-- STDOUT --")
                     print(stdout.rstrip())
                 if stderr:
                     print("-- STDERR --")
                     print(stderr.rstrip(), file=sys.stderr)
+
                 messages.append({"role": "assistant", "content": json.dumps(data)})
                 output_summary = (
                     f"Command: {cmd}\n"
-                    f"Return code: {returncode}\n"
-                    f"STDOUT:\n{stdout}\n"
-                    f"STDERR:\n{stderr}"
+                    f"Return code: {rc}\n"
+                    f"STDOUT:\n{clip(stdout)}\n"
+                    f"STDERR:\n{clip(stderr)}"
                 )
                 messages.append({"role": "user", "content": output_summary})
-                if returncode != 0:
+                log(f"cmd='{cmd}' rc={rc}", args.log_file)
+
+                if rc != 0:
                     failed_commands_count[cmd] = failed_commands_count.get(cmd, 0) + 1
-                    command_errors[cmd] = stderr.strip() or stdout.strip()
+                    command_errors[cmd] = (stderr or stdout).strip()
+
             if skip_remaining:
                 continue
-            # If model signalled completion, break loop
+
             if isinstance(finished_flag, bool) and finished_flag:
                 print("\nTask complete.\nSummary:")
                 print(explanation)
                 finished = True
                 break
+
             time.sleep(1)
+
         if not finished and step_num >= args.max_steps:
             print("Maximum number of steps reached. The task may not be complete.")
-        # After completing the current task we loop back to ask for the next task
 
-    # Upon exiting the interactive loop, report token usage and estimated cost
     if total_prompt_tokens or total_completion_tokens:
         pricing = {
             "gpt-4o": {"input": 0.0025, "output": 0.01},
@@ -446,8 +442,8 @@ def main() -> None:
             print(f"Estimated cost for model '{args.model}': ${cost:.4f} (USD)")
         else:
             print(
-                f"\nToken usage: prompt={total_prompt_tokens}, completion={total_completion_tokens}."
-                f"  Cost calculation not implemented for model '{args.model}'."
+                f"\nToken usage: prompt={total_prompt_tokens}, completion={total_completion_tokens}. "
+                f"Cost calculation not implemented for model '{args.model}'."
             )
 
 
@@ -456,66 +452,48 @@ if __name__ == "__main__":
 PYCODE
 ${SUDO} chmod 644 "$DEST_DIR/ai_server_agent.py"
 
-# Write the report file alongside the agent for reference
+# Write the report file alongside the agent for reference (cleaned citations)
 echo "[INFO] Writing report to $DEST_DIR/report.md"
 ${SUDO} tee "$DEST_DIR/report.md" >/dev/null <<'REPORTDOC'
 # Agente autónomo para administrar un servidor Debian con OpenAI
 
 ## Antecedentes y consideraciones
 
-Para convertir órdenes en lenguaje natural en acciones sobre un servidor es posible usar un agente que llame a la API de OpenAI y que ejecute comandos de *shell* en ciclos.  Existen herramientas de línea de comandos como **shellgpt** que generan órdenes y piden confirmación del usuario antes de ejecutarlas.  Su `README` explica que, al usar la opción `--shell`, genera un comando adecuado para el sistema operativo y solicita `[E]xecute`, `[D]escribe` o `[A]bort`【206575835293472†L338-L363】.  Este tipo de herramientas requieren que el usuario revise las órdenes por motivos de seguridad.  Igualmente, proyectos como **ai‑shell‑agent** advierten que las herramientas basadas en LLM pueden generar comandos erróneos o destructivos y recomiendan usarlas bajo su propio riesgo【114342969493772†L209-L213】.  En su documentación se indica que el agente puede ejecutar y depurar comandos en varios pasos, utilizando el patrón ReACT para iterar hasta completar la tarea【114342969493772†L184-L189】.
+Un agente que llama a la API de OpenAI puede convertir peticiones en lenguaje natural en comandos de shell, ejecutarlos y aprender de la salida en ciclos hasta completar una tarea. Herramientas como *shellgpt* piden confirmación antes de ejecutar lo que proponen por motivos de seguridad. Otros proyectos similares avisan de que los modelos pueden generar comandos erróneos o destructivos y recomiendan usarlos bajo tu propio riesgo.
 
-La implantación que se propone se inspira en estos enfoques, pero automatiza la ejecución de comandos sin intervención humana.  Se han incorporado salvaguardas básicas para bloquear órdenes claramente peligrosas (como `rm -rf /` o `shutdown`), aunque se recomienda ejecutar el agente en un entorno de pruebas y **nunca** en sistemas críticos.  El script necesita disponer de una clave de API válida; el usuario debe exportarla en la variable `OPENAI_API_KEY`.
+La implementación propuesta automatiza la ejecución sin intervención humana. Incluye salvaguardas para bloquear órdenes claramente peligrosas (por ejemplo, `rm -rf /`, `shutdown`, `mkfs`, `dd`). Aun así, se recomienda usarla en entornos de pruebas y **nunca** en sistemas críticos. Se requiere una clave de API válida exportada en la variable `OPENAI_API_KEY`.
 
 ## Instalación en Debian 12
 
-En este script se incluye un instalador que prepara el entorno en un servidor Debian 12.  El script:
-
-1. Actualiza los índices de paquetes e instala Python 3 con `pip` y el módulo `venv`.
-2. Crea el directorio `/opt/ai‑agent`, escribe el archivo `ai_server_agent.py` y el presente informe, y prepara un entorno virtual en `venv`.
-3. Instala la biblioteca `openai` en el entorno virtual.
-4. Genera un ejecutable `/usr/local/bin/ai‑agent` que encapsula el entorno virtual y lanza el agente.
-5. Solicita la clave de API al usuario al final de la instalación y, si se introduce, ejecuta el agente.
-
-El instalador detecta si `sudo` está disponible; en contenedores sin `sudo` ejecutará las órdenes directamente.  Se debe ejecutar con privilegios suficientes para instalar paquetes y escribir en `/opt` y `/usr/local/bin`.
+El instalador:
+1. Comprueba permisos, advierte si la distribución no es Debian 12 y evita instalaciones concurrentes.
+2. Actualiza índices de paquetes e instala Python 3 con `pip` y `venv`.
+3. Crea `/opt/ai-agent`, escribe `ai_server_agent.py` y este informe.
+4. Crea un entorno virtual en `venv` e instala `openai` con versión acotada.
+5. Genera el ejecutable `/usr/local/bin/ai-agent`.
+6. Permite introducir la clave y, si se facilita, ejecuta el agente.
 
 ## Funcionamiento del agente
 
-El fichero `ai_server_agent.py` implementa la lógica de la conversación con OpenAI y la ejecución de comandos.  Su funcionamiento se resume en estos pasos:
-
-1. **Contexto inicial**.  Establece un mensaje de sistema que explica al modelo su rol: debe recibir una instrucción del usuario, razonar paso a paso qué hacer y devolver un objeto JSON con tres campos: `commands` (lista de comandos), `explanation` (explicación breve) y `finished` (booleano que indica si ha terminado).  Se insiste en que debe evitar operaciones destructivas y en que la respuesta siempre debe ser JSON.
-2. **Ciclo de razonamiento**.  En cada iteración el script envía todas las interacciones previas al modelo y recibe un objeto JSON.  Si el campo `finished` es `true`, muestra el resumen y termina.  En caso contrario, ejecuta cada comando propuesto utilizando `subprocess.run`, captura su salida y la añade a la conversación.  La salida (código de retorno, STDOUT y STDERR) sirve de contexto para la siguiente consulta al modelo.
-3. **Salvaguardas**.  Antes de ejecutar cada orden se aplica una heurística simple para bloquear comandos obviamente peligrosos (`rm -rf /`, `mkfs`, `shutdown`, etc.).  Si se detecta uno, se informa al modelo de que la orden fue bloqueada y se solicita un comando alternativo.
-4. **Límites**.  Para prevenir bucles infinitos se puede establecer un número máximo de iteraciones con la opción `--max-steps` (por defecto, 10).  Si se alcanza este límite sin que el modelo marque la tarea como terminada, el script finaliza.
-5. **Modelo configurable**.  Se puede elegir el modelo de OpenAI mediante `--model`; por defecto usa `gpt-4o`.  La temperatura se fija en `0` para obtener salidas deterministas.
-
-### Sesión interactiva
-
-La versión actual del agente admite un modo **interactivo**.  En lugar de finalizar tras completar una tarea, el programa pregunta al usuario si desea realizar otra acción; si se introduce un nuevo comando (o petición en lenguaje natural), este se añade a la misma conversación y el modelo lo tendrá en cuenta como contexto.  El ciclo de razonamiento y ejecución se repite para cada nueva orden hasta que el usuario presiona *Enter* sin texto o escribe `exit`/`quit`/`q`.  Los tokens consumidos se acumulan durante toda la sesión y, al salir, se muestra la estimación de coste.  Esta modalidad facilita encadenar peticiones relacionadas sin reiniciar el programa.
-
-Además, el sistema resetea la lista de comandos fallidos al iniciar cada nueva orden, de modo que los errores previos no bloquean comandos legítimos en tareas posteriores.  Esta sesión interactiva permite realizar varias operaciones encadenadas sin perder el contexto ni tener que volver a invocar el script.  Si no se desea este comportamiento, se puede seguir proporcionando la instrucción inicial mediante `--task` y salir después del primer ciclo.
+1. **Contexto inicial**: Mensaje de sistema que fija el rol y un esquema JSON estricto: `commands[]`, `explanation`, `finished`.
+2. **Bucle de razonamiento**: El modelo propone comandos; el agente los ejecuta, captura STDOUT/STDERR y alimenta la siguiente iteración.
+3. **Salvaguardas**: Filtro reforzado de comandos peligrosos con expresiones regulares.
+4. **Límites y control**: `--max-steps`, `--max-commands-per-step`, `--timeout` por comando, recorte de salidas largas, y reintento si el modelo devuelve JSON inválido.
+5. **Modos de ejecución**: `--dry-run` para simular, `--confirm` para pedir confirmación, y `--log-file` para registrar actividad.
 
 ## Uso básico
 
-Una vez instalado el agente se puede ejecutar así:
-
 ```bash
-export OPENAI_API_KEY=sk-***************  # clave de API de OpenAI
+export OPENAI_API_KEY=sk-***************
 ai-agent --task "instala nginx y levanta el servicio"
 ```
 
-El agente generará un plan, ejecutará los comandos necesarios (por ejemplo, `sudo apt update && sudo apt install -y nginx` seguido de `sudo systemctl enable --now nginx`) y evaluará la salida de cada orden.  En cada paso mostrará qué pretende hacer y el resultado de cada ejecución.  Cuando determine que la tarea ha finalizado, imprimirá un breve resumen y terminará.  Para otras tareas se puede omitir `--task` y escribir la petición cuando el script la solicite.
-
-## Archivo generado
-
-Se han creado dos archivos que forman el corazón del despliegue:
+## Archivos
 
 | Archivo | Propósito |
 |---|---|
-| `ai_server_agent.py` | Implementa el agente autónomo en Python. Gestiona la conversación con la API de OpenAI, ejecuta los comandos propuestos y controla el flujo hasta completar la tarea. Incluye salvaguardas contra comandos destructivos. |
-| `install_ai_agent.sh` | Script de instalación para Debian 12. Prepara el entorno, instala dependencias, copia el agente y genera el comando `ai‑agent`. |
-
-Ambos ficheros están disponibles en esta respuesta y pueden desplegarse directamente en el servidor.
+| `ai_server_agent.py` | Lógica del agente, conversación con la API, ejecución, salvaguardas. |
+| `install_ai_agent.sh` | Instalador y bootstrap en Debian 12. |
 REPORTDOC
 ${SUDO} chmod 644 "$DEST_DIR/report.md"
 
@@ -526,15 +504,14 @@ if [ ! -d "$VENV_DIR" ]; then
     ${SUDO} python3 -m venv "$VENV_DIR"
 fi
 
-# Install Python dependencies inside the virtual environment
+# Install Python dependencies inside the virtual environment (pin version range)
 echo "[INFO] Installing Python dependencies into the virtual environment..."
 ${SUDO} "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
-${SUDO} "$VENV_DIR/bin/pip" install --no-cache-dir openai >/dev/null
+${SUDO} "$VENV_DIR/bin/pip" install --no-cache-dir 'openai>=1.40,<2' >/dev/null
 
 # Create a wrapper executable in /usr/local/bin
 WRAPPER="/usr/local/bin/ai-agent"
 echo "[INFO] Creating wrapper executable $WRAPPER"
-# Use a single‑quoted here‑doc to prevent variable expansion during script creation.
 ${SUDO} tee "$WRAPPER" >/dev/null <<'EOF'
 #!/bin/bash
 # Wrapper for launching the AI server agent
@@ -559,20 +536,15 @@ ${SUDO} chmod +x "$WRAPPER"
 echo "[SUCCESS] Installation complete."
 echo ""
 # Prompt the user for an API key and optionally run the agent immediately.
-read -r -p "Introduce tu clave OpenAI API para ejecutar el agente ahora (deja en blanco para omitir): " API_KEY_INPUT
+read -r -s -p "Introduce tu clave OpenAI API para ejecutar el agente ahora (se ocultará, deja en blanco para omitir): " API_KEY_INPUT
+echo
 if [ -n "$API_KEY_INPUT" ]; then
     export OPENAI_API_KEY="$API_KEY_INPUT"
     echo "[INFO] Ejecutando el agente interactivo..."
-    # Use the Python binary in the virtual environment to run the agent. Forward any additional
-    # arguments passed to this installer script to the Python program. This allows calls like
-    # ./install_ai_agent.sh --task "mi primera orden".
+    # Forward any additional args to the Python program.
     "$VENV_DIR/bin/python" "$DEST_DIR/ai_server_agent.py" "$@"
 else
-    echo "No se ha introducido ninguna clave; la instalación ha finalizado sin ejecutar el agente."
-    echo "Para utilizar el agente más adelante, exporta tu clave y ejecuta el wrapper:\n"
-    echo "  export OPENAI_API_KEY=<tu-clave>"
-    echo "  ai-agent --task \"tu instrucción\""
+    printf "No se ha introducido ninguna clave; la instalación ha finalizado sin ejecutar el agente.\n"
+    printf "Para utilizar el agente más adelante:\n  export OPENAI_API_KEY=<tu-clave>\n  ai-agent --task \"tu instrucción\"\n"
 fi
-echo ""
-echo "Puedes volver a ejecutar este script en cualquier momento para actualizar el agente,"
-echo "reescribir el informe o introducir una nueva clave de API."
+printf "\nPuedes volver a ejecutar este script para actualizar el agente, reescribir el informe o introducir una nueva clave de API.\n"
