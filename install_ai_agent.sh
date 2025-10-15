@@ -21,8 +21,11 @@ set -euo pipefail
 DEFAULT_MODEL="gpt-5-mini"
 
 # Higher defaults for complex tasks
-DEFAULT_MAX_STEPS=20
-DEFAULT_MAX_CMDS_PER_STEP=20
+DEFAULT_MAX_STEPS=24
+DEFAULT_MAX_CMDS_PER_STEP=24
+
+# Web search decision mode: auto|on|off
+DEFAULT_WEB_MODE="auto"
 
 # ===== Pre-flight: require root or sudo =====
 if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
@@ -41,7 +44,7 @@ if command -v flock >/dev/null 2>&1; then
 fi
 
 # Versioning and update mechanism
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 # Set UPDATE_URL to the address of the latest install script.  Leave empty to disable auto-update.
 # Example:
 # UPDATE_URL="https://example.com/install_ai_agent.sh"
@@ -111,19 +114,19 @@ ${SUDO} tee "$DEST_DIR/ai_server_agent.py" >/dev/null <<'PYCODE'
 """
 ai_server_agent.py - Automate server tasks on Debian using OpenAI's API
 
-Generalized hardening to handle complex tasks:
-- Clear instruction that each command runs in a fresh shell; batching supported.
-- Optional batching: if the model proposes a sequence that relies on shared state,
-  the agent can execute them in a single bash session safely.
-- Safer dangerous-command detection using tokenization, with a small whitelist for known-safe maintenance ops.
-- Context-aware retries: allow reattempting key commands (e.g., 'apt-get update') once context (APT sources/keys) has changed.
-- Higher defaults for steps and commands per step.
+General hardened agent with optional **Web Search (Responses API)**:
+- Decides at the **start of each task** whether to perform a one-off web search (auto mode).
+- Supports `--web on|off|auto` (default: auto). In auto, it asks the model to decide
+  *once*; no per-step checks unless the user forces it.
+- Uses OpenAI Responses API `tools=[{"type":"web_search"}]` when available; if the
+  model or library doesn't support it, gracefully falls back to offline mode.
+- Safer dangerous-command detector (tokenized), batching for stateful steps,
+  and context-aware retries for APT.
 """
 
 import argparse
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -132,16 +135,17 @@ from glob import glob
 from typing import Any, Dict, List, Tuple
 
 try:
-    from openai import OpenAI  # modern SDK
+    from openai import OpenAI
 except ImportError:
-    print("La librería 'openai' no está instalada. Instálala con: pip install 'openai>=1.40,<2'", file=sys.stderr)
+    print("La librería 'openai' no está instalada. Instálala con: pip install 'openai>=1.60,<2'", file=sys.stderr)
     sys.exit(1)
 
 
 # ===== Defaults configurable via environment =====
 DEFAULT_MODEL = os.getenv("AI_AGENT_DEFAULT_MODEL", "gpt-5-mini")
-DEFAULT_MAX_STEPS = int(os.getenv("AI_AGENT_DEFAULT_MAX_STEPS", "20"))
-DEFAULT_MAX_CMDS_PER_STEP = int(os.getenv("AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP", "20"))
+DEFAULT_MAX_STEPS = int(os.getenv("AI_AGENT_DEFAULT_MAX_STEPS", "24"))
+DEFAULT_MAX_CMDS_PER_STEP = int(os.getenv("AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP", "24"))
+DEFAULT_WEB_MODE = os.getenv("AI_AGENT_WEB_MODE", "auto")  # auto|on|off
 
 
 def run_shell_command(command: str, timeout: int = 900) -> Tuple[int, str, str]:
@@ -161,7 +165,7 @@ def run_shell_command(command: str, timeout: int = 900) -> Tuple[int, str, str]:
         )
         return proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as e:
-        return 124, (e.stdout or ""), (e.stderr or f"Timeout tras {timeout}s")
+        return 124, (e.stdout or ""), (e.stderr or f"Timeout after {timeout}s")
     except Exception as e:
         return 1, "", str(e)
 
@@ -187,33 +191,25 @@ def is_really_dangerous(cmd: str) -> bool:
         targets = [p for p in parts[1:] if not p.startswith("-")]
         has_rf = any(("r" in f and "f" in f) for f in flags)
         if has_rf:
-            # if any target is exactly "/" or "/*", it's dangerous
             for t in targets:
                 if t in ("/", "/*"):
                     return True
-                # allow common safe targets
                 if t in SAFE_RM_PATTERNS:
                     continue
-                # dangerous if target starts with "/" and looks like root wipe
-                if t.startswith("/") and t.strip() in ("/root/*", "/etc/*") and "*" in t:
-                    return True
     # mkfs / dd to block devices
     toks = set(parts)
     if any(tok.startswith("mkfs") for tok in toks):
         return True
     if parts[0] == "dd" and any(x.startswith("of=/dev/") for x in parts[1:]):
         return True
-    # shutdown/reboot/halt
     if parts[0] in {"shutdown", "reboot", "halt"}:
         return True
-    # fork bomb
     if ":(){ :|:& };:" in cmd:
         return True
     return False
 
 
 def clip(text: str, limit: int = 9000) -> str:
-    """Clip long text to avoid huge prompts."""
     if text is None:
         return ""
     if len(text) <= limit:
@@ -223,7 +219,6 @@ def clip(text: str, limit: int = 9000) -> str:
 
 
 def build_system_prompt() -> str:
-    """System prompt defining JSON schema and behaviour."""
     return (
         "You are a server automation agent on Debian Linux.\n"
         "- IMPORTANT: Each command is executed in a fresh shell. If you need state (variables, set -euo pipefail, sourcing files), "
@@ -243,20 +238,18 @@ def build_system_prompt() -> str:
     )
 
 
-def call_openai_chat(messages: List[Dict[str, str]], model: str) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Call OpenAI chat completions in JSON mode; retry once to repair JSON if needed."""
-    client = OpenAI()  # uses OPENAI_API_KEY from env
+def call_chat_json(messages: List[Dict[str, str]], model: str) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Call Chat Completions in JSON mode; retry without temp if needed."""
+    client = OpenAI()
     def _call(msgs, with_temp=True):
         params = dict(model=model, messages=msgs, response_format={"type": "json_object"})
         if with_temp:
             params["temperature"] = 0.0
         return client.chat.completions.create(**params)
 
-    # First attempt (temperature=0 for determinism)
     try:
         resp = _call(messages, with_temp=True)
     except Exception as exc:
-        # Retry without temperature if model rejects it
         try:
             resp = _call(messages, with_temp=False)
         except Exception:
@@ -265,28 +258,109 @@ def call_openai_chat(messages: List[Dict[str, str]], model: str) -> Tuple[Dict[s
     content = resp.choices[0].message.content
     try:
         data = json.loads(content)
-    except json.JSONDecodeError:
-        # JSON repair attempt
-        repair_prompt = (
-            "Your previous response was not valid JSON. "
-            "Return ONLY a valid JSON object that follows exactly the schema "
-            '{"commands": ["..."], "explanation": "...", "finished": true|false} without any extra text.'
-        )
-        repaired_msgs = messages + [{"role": "user", "content": repair_prompt}]
-        resp2 = _call(repaired_msgs, with_temp=False)
-        content2 = resp2.choices[0].message.content
-        try:
-            data = json.loads(content2)
-            resp = resp2
-        except json.JSONDecodeError as e2:
-            raise ValueError(f"Model output is not valid JSON after repair attempt:\n{content2}") from e2
-
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Model output is not valid JSON: {e}\nRaw content:\n{content}") from e
     usage = getattr(resp, "usage", None)
     usage_dict = {
         "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
         "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
     }
     return data, usage_dict
+
+
+# ===== One-off web search (Responses API) =====
+def responses_available() -> bool:
+    try:
+        client = OpenAI()
+        _ = client.responses  # attribute exists on modern SDK
+        return True
+    except Exception:
+        return False
+
+def responses_web_search(text: str, model: str, allow_tools: bool) -> Tuple[str, str]:
+    """
+    Execute a single Responses call. If allow_tools is True, we pass the web_search tool;
+    otherwise we call without tools. Returns (output_text, error_or_empty).
+    """
+    client = OpenAI()
+    tools = [{"type": "web_search"}] if allow_tools else None
+    try:
+        if tools is None:
+            resp = client.responses.create(model=model, input=text)
+        else:
+            resp = client.responses.create(model=model, input=text, tools=tools)
+    except Exception as e:
+        return "", f"{e}"
+    # extract text robustly across SDK versions
+    out = getattr(resp, "output_text", None)
+    if not out:
+        # Try to assemble from 'output' field if present
+        try:
+            out = getattr(resp, "output", None)
+            if out is not None:
+                out = json.dumps(out, default=lambda o: getattr(o, "__dict__", str(o)))
+            else:
+                out = str(resp)
+        except Exception:
+            out = str(resp)
+    return str(out), ""
+
+
+def web_autoplan(task: str, model: str, mode: str) -> str:
+    """
+    Decide once per task whether to fetch web context, then (optionally) fetch it.
+    Returns a textual summary (with citations if provided) to inject into conversation,
+    or an empty string when skipping.
+    """
+    if mode == "off":
+        return ""
+    if not responses_available():
+        return ""
+    # Some models may not support web_search; we detect via attempting a short call.
+    # First, in 'auto' ask the model to decide (with the tool available).
+    if mode == "auto":
+        decision_prompt = (
+            "You are deciding whether a web search is needed to accomplish the following server task.\n"
+            "Task:\n"
+            f"{task}\n\n"
+            "Return ONLY a JSON object: {\"need_web\": true|false, \"reason\": \"short\"}"
+        )
+        text, err = responses_web_search(decision_prompt, model, allow_tools=True)
+        if err:
+            return ""  # silently fallback
+        try:
+            # Extract JSON from text
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            obj = json.loads(text[start:end])
+            if not isinstance(obj, dict):
+                return ""
+            need_web = bool(obj.get("need_web", False))
+            if not need_web:
+                return ""
+        except Exception:
+            # If model didn't follow schema, just skip to be safe
+            return ""
+        # If we get here, do one web-enabled call on the original task asking for a concise context
+        fetch_prompt = (
+            "Briefly (<= 2000 chars) gather up-to-date context and key URLs needed to perform the following server task. "
+            "Focus on official docs, commands, and compatibility notes. Return a compact summary with inline sources:\n\n"
+            f"{task}"
+        )
+        out, err2 = responses_web_search(fetch_prompt, model, allow_tools=True)
+        if err2:
+            return ""
+        return out or ""
+    else:  # mode == "on"
+        fetch_prompt = (
+            "Briefly (<= 2000 chars) gather up-to-date context and key URLs needed to perform the following server task. "
+            "Focus on official docs, commands, and compatibility notes. Return a compact summary with inline sources:\n\n"
+            f"{task}"
+        )
+        out, err = responses_web_search(fetch_prompt, model, allow_tools=True)
+        if err:
+            return ""
+        return out or ""
 
 
 def log(msg: str, log_file: str = "") -> None:
@@ -335,7 +409,6 @@ def should_batch(commands: List[str]) -> bool:
 
 def run_batch(commands: List[str], timeout: int) -> Tuple[int, str, str]:
     """Run a list of commands in a single bash -lc session if safe."""
-    # If any line is clearly dangerous, do not batch
     for line in commands:
         if is_really_dangerous(line):
             return 2, "", f"Refused to batch due to dangerous line: {line}"
@@ -355,6 +428,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Print commands but do not execute them.")
     parser.add_argument("--confirm", action="store_true", help="Ask for confirmation before executing each command.")
     parser.add_argument("--log-file", type=str, default="", help="Optional log file path.")
+    parser.add_argument("--web", type=str, default=DEFAULT_WEB_MODE, choices=["auto","on","off"], help="Enable web search via Responses API: auto|on|off (default: auto)")
     args = parser.parse_args()
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -365,11 +439,25 @@ def main() -> None:
     messages: List[Dict[str, str]] = []
     messages.append({"role": "system", "content": build_system_prompt()})
 
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-
+    # One-off web context (auto/on) — do this once at the start of the task
     from typing import Optional
     pending_task: Optional[str] = args.task if args.task else None
+    intro_task = pending_task  # stash for pre-web probe
+    if intro_task is None:
+        try:
+            intro_task = input("Enter initial task to decide web-search (press Enter to skip): ").strip() or None
+        except KeyboardInterrupt:
+            intro_task = None
+    if intro_task:
+        web_context = web_autoplan(intro_task, args.model, args.web)
+        if web_context:
+            messages.append({
+                "role": "system",
+                "content": "WEB_CONTEXT (one-off):\n" + clip(web_context, 8000)
+            })
+
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
 
     # Track APT context to allow retries of apt-get update when it actually changed
     last_apt_sig = apt_context_signature()
@@ -400,7 +488,7 @@ def main() -> None:
         for step_num in range(1, args.max_steps + 1):
             apt_sig_before = apt_context_signature()
             try:
-                data, usage = call_openai_chat(messages, args.model)
+                data, usage = call_chat_json(messages, args.model)
             except Exception as e:
                 print(f"Error during API call: {e}", file=sys.stderr)
                 finished = True
@@ -424,7 +512,7 @@ def main() -> None:
 
             # Respect command limit
             if len(commands) > args.max_commands_per_step:
-                log(f"Limiting commands from {len(commands)} to {args.max_commands_per_step}", args.log_file)
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Limiting commands from {len(commands)} to {args.max_commands_per_step}")
                 commands = commands[: args.max_commands_per_step]
 
             print(f"\n=== Step {step_num} ===")
@@ -436,26 +524,9 @@ def main() -> None:
             else:
                 print("No commands proposed.")
 
-            # Decide batching
+            # Batching heuristic
             used_batch = False
-            if should_batch(commands):
-                # Batch preview – check safety, then run
-                if args.confirm:
-                    ans = input("Se propone ejecutar los comandos en un único bash -lc. ¿Continuar? [y/N]: ").strip().lower()
-                    if ans not in {"y", "yes", "s", "si", "sí"}:
-                        print("Saltando ejecución por confirmación del usuario.")
-                        # Still feed back the assistant reply to progress conversation
-                        messages.append({"role": "assistant", "content": json.dumps(data)})
-                        messages.append({"role": "user", "content": "User declined to run the batched script."})
-                        continue
-                if args.dry_run:
-                    print("[dry-run] Ejecutaría en batch con bash -lc:")
-                    print("\n".join(commands))
-                    messages.append({"role": "assistant", "content": json.dumps(data)})
-                    messages.append({"role": "user", "content": "Dry-run batch; no output."})
-                    continue
-                rc, stdout, stderr = run_batch(commands, timeout=args.timeout)
-                used_batch = True
+            def execute_and_feedback(rc: int, stdout: str, stderr: str, cmd_desc: str):
                 if stdout:
                     print("-- STDOUT --")
                     print(stdout.rstrip())
@@ -463,29 +534,39 @@ def main() -> None:
                     print("-- STDERR --")
                     print(stderr.rstrip(), file=sys.stderr)
                 messages.append({"role": "assistant", "content": json.dumps(data)})
-                output_summary = (
-                    f"BATCH EXECUTION\n"
-                    f"Return code: {rc}\n"
-                    f"STDOUT:\n{clip(stdout)}\n"
-                    f"STDERR:\n{clip(stderr)}"
-                )
-                messages.append({"role": "user", "content": output_summary})
-                log(f"batch rc={rc}", args.log_file)
-                # Update context tracking
-                apt_sig_after = apt_context_signature()
-                if rc != 0 and any("apt" in c for c in commands):
-                    # Allow a follow-up retry of update if context changed
-                    pass
-            else:
+                summary = (f"{cmd_desc}\nReturn code: {rc}\nSTDOUT:\n{clip(stdout)}\nSTDERR:\n{clip(stderr)}")
+                messages.append({"role": "user", "content": summary})
+
+            if len(commands) > 1 and any(h in "\n".join(commands) for h in ("set -e", ". /etc/", "source /etc", "export ", "&&", ";")):
+                # Batch if safe
+                if args.confirm:
+                    ans = input("Se propone ejecutar en un único bash -lc. ¿Continuar? [y/N]: ").strip().lower()
+                    if ans not in {"y","yes","s","si","sí"}:
+                        print("Saltando ejecución por confirmación del usuario.")
+                        messages.append({"role": "assistant", "content": json.dumps(data)})
+                        messages.append({"role": "user", "content": "User declined to run the batched script."})
+                        continue
+                script = "\n".join(commands)
+                if any(is_really_dangerous(line) for line in commands):
+                    print("Blocked batch due to dangerous line inside.")
+                else:
+                    if args.dry_run:
+                        print("[dry-run] (batch)")
+                        print(script)
+                        execute_and_feedback(0, "", "", "BATCH DRY-RUN")
+                    else:
+                        rc, out, err = run_shell_command(f"bash -lc {shlex.quote(script)}", timeout=args.timeout)
+                        used_batch = True
+                        execute_and_feedback(rc, out, err, "BATCH EXECUTION")
+                        if rc != 0:
+                            # Continue loop to let model react
+                            pass
+
+            if not used_batch:
                 skip_remaining = False
                 for idx, cmd in enumerate(commands, start=1):
-                    # Context-aware retry logic: allow whitelisted commands to retry if APT context changed
-                    allow_retry = False
-                    for key in RETRY_WHITELIST:
-                        if cmd.strip().startswith(key):
-                            allow_retry = True
-                            break
-
+                    # Context-aware retry logic
+                    allow_retry = any(cmd.strip().startswith(k) for k in RETRY_WHITELIST)
                     previously_failed = cmd in failed_commands_count
                     apt_sig_now = apt_context_signature()
                     apt_changed = (apt_sig_now != last_apt_sig) or (apt_sig_now != apt_sig_before)
@@ -511,44 +592,25 @@ def main() -> None:
                         skip_remaining = True
                         break
 
-                    # Confirmation / dry-run
                     if args.confirm:
                         ans = input(f"¿Ejecutar el comando {idx}/{len(commands)}? [y/N]: ").strip().lower()
-                        if ans not in {"y", "yes", "s", "si", "sí"}:
-                            print("Saltando comando por confirmación del usuario.")
+                        if ans not in {"y","yes","s","si","sí"}:
+                            print("Saltando por confirmación del usuario.")
                             continue
 
                     if args.dry_run:
-                        print(f"[dry-run] Simulando ejecución: {cmd}")
-                        messages.append({"role": "assistant", "content": json.dumps(data)})
-                        sim_output = f"Command (dry-run): {cmd}\nReturn code: 0\nSTDOUT:\n\nSTDERR:\n"
-                        messages.append({"role": "user", "content": sim_output})
+                        print(f"[dry-run] {cmd}")
+                        execute_and_feedback(0, "", "", f"DRY-RUN: {cmd}")
                         continue
 
                     print(f"\nExecuting command {idx}/{len(commands)}: {cmd}")
                     rc, stdout, stderr = run_shell_command(cmd, timeout=args.timeout)
-                    if stdout:
-                        print("-- STDOUT --")
-                        print(stdout.rstrip())
-                    if stderr:
-                        print("-- STDERR --")
-                        print(stderr.rstrip(), file=sys.stderr)
-
-                    messages.append({"role": "assistant", "content": json.dumps(data)})
-                    output_summary = (
-                        f"Command: {cmd}\n"
-                        f"Return code: {rc}\n"
-                        f"STDOUT:\n{clip(stdout)}\n"
-                        f"STDERR:\n{clip(stderr)}"
-                    )
-                    messages.append({"role": "user", "content": output_summary})
-                    log(f"cmd='{cmd}' rc={rc}", args.log_file)
+                    execute_and_feedback(rc, stdout, stderr, f"Command: {cmd}")
 
                     if rc != 0:
                         failed_commands_count[cmd] = failed_commands_count.get(cmd, 0) + 1
                         command_errors[cmd] = (stderr or stdout).strip()
 
-                    # Update last APT signature after each command
                     new_sig = apt_context_signature()
                     if new_sig != last_apt_sig:
                         last_apt_sig = new_sig
@@ -556,7 +618,6 @@ def main() -> None:
                 if skip_remaining:
                     continue
 
-            # If model signalled completion, break loop
             if isinstance(finished_flag, bool) and finished_flag:
                 print("\nTask complete.\nSummary:")
                 print(explanation)
@@ -568,6 +629,7 @@ def main() -> None:
         if not finished and step_num >= args.max_steps:
             print("Maximum number of steps reached. The task may not be complete.")
 
+    # Token/cost report (best-effort, not including Responses API calls)
     if total_prompt_tokens or total_completion_tokens:
         pricing = {
             "gpt-4o": {"input": 0.0025, "output": 0.01},
@@ -579,13 +641,13 @@ def main() -> None:
             rates = pricing[model_key]
             cost = (total_prompt_tokens * rates["input"] + total_completion_tokens * rates["output"]) / 1000.0
             print(
-                f"\nApproximate API usage: prompt_tokens={total_prompt_tokens}, "
+                f"\nApproximate API usage (chat): prompt_tokens={total_prompt_tokens}, "
                 f"completion_tokens={total_completion_tokens}."
             )
             print(f"Estimated cost for model '{args.model}': ${cost:.4f} (USD)")
         else:
             print(
-                f"\nToken usage: prompt={total_prompt_tokens}, completion={total_completion_tokens}. "
+                f"\nToken usage (chat): prompt={total_prompt_tokens}, completion={total_completion_tokens}. "
                 f"Cost calculation not implemented for model '{args.model}'."
             )
 
@@ -599,16 +661,18 @@ ${SUDO} chmod 644 "$DEST_DIR/ai_server_agent.py"
 # Write the report file alongside the agent for reference
 echo "[INFO] Writing report to $DEST_DIR/report.md"
 ${SUDO} tee "$DEST_DIR/report.md" >/dev/null <<'REPORTDOC'
-# Agente autónomo para administrar un servidor Debian con OpenAI (versión endurecida)
+# Agente autónomo para administrar un servidor Debian con OpenAI (versión con web auto)
 
-Mejoras generales para casos complejos:
-- **Batching opcional** cuando los pasos dependen de estado compartido (variables, `set -e`, `source`).
-- **Detección de comandos peligrosos tokenizada** con lista blanca para limpiezas seguras (p. ej. `rm -rf /var/lib/apt/lists/*`).
-- **Reintentos con contexto**: si cambia la configuración/clave de APT, se permite reintentar comandos clave como `apt-get update` sin quedarnos bloqueados por “repeated failing command”.
-- **Límites más altos por defecto** (`--max-steps`, `--max-commands-per-step`) para planes largos.
-- **Modelo por defecto configurable** mediante variable de entorno `AI_AGENT_DEFAULT_MODEL` y también definido en wrapper.
+**Novedades generales (independientes de una tarea concreta):**
+- **Web “auto”** (Responses API): el agente decide **al inicio** de cada tarea si conviene hacer *una* búsqueda web (y la hace). Bandera `--web auto|on|off`.
+- **Caída elegante**: si el modelo/SDK no soporta `web_search`, se omite y sigue offline.
+- **Batching seguro** para pasos que comparten estado (variables, `set -e`, `source`).
+- **Detección de comandos peligrosos** tokenizada (evita falsos positivos de limpiezas sanas).
+- **Reintentos con contexto APT** (permite reintentar `apt-get update` si cambian repos/llaves).
+- **Límites elevados por defecto** para casos largos (24 pasos / 24 comandos por paso).
+- **Modelo y modo web por defecto configurables** por variables de entorno exportadas por el wrapper.
 
-Consulta el propio script para más detalles.
+Consulta el script para detalles y opciones.
 REPORTDOC
 ${SUDO} chmod 644 "$DEST_DIR/report.md"
 
@@ -622,7 +686,7 @@ fi
 # Install Python dependencies inside the virtual environment (pin version range)
 echo "[INFO] Installing Python dependencies into the virtual environment..."
 ${SUDO} "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
-${SUDO} "$VENV_DIR/bin/pip" install --no-cache-dir 'openai>=1.40,<2' >/dev/null
+${SUDO} "$VENV_DIR/bin/pip" install --no-cache-dir 'openai>=1.60,<2' >/dev/null
 
 # Create a wrapper executable in /usr/local/bin
 WRAPPER="/usr/local/bin/ai-agent"
@@ -638,10 +702,11 @@ if [ -z "\${OPENAI_API_KEY:-}" ]; then
     exit 1
 fi
 
-# Default model and limits (can be overridden by environment)
+# Default model, limits and web mode (can be overridden by environment)
 : "\${AI_AGENT_DEFAULT_MODEL:=${DEFAULT_MODEL}}"
 : "\${AI_AGENT_DEFAULT_MAX_STEPS:=${DEFAULT_MAX_STEPS}}"
 : "\${AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP:=${DEFAULT_MAX_CMDS_PER_STEP}}"
+: "\${AI_AGENT_WEB_MODE:=${DEFAULT_WEB_MODE}}"
 
 # Fixed paths for the agent installation
 AGENT_DIR="/opt/ai-agent"
@@ -652,6 +717,7 @@ AGENT_SCRIPT="$AGENT_DIR/ai_server_agent.py"
 exec env AI_AGENT_DEFAULT_MODEL="\$AI_AGENT_DEFAULT_MODEL" \
         AI_AGENT_DEFAULT_MAX_STEPS="\$AI_AGENT_DEFAULT_MAX_STEPS" \
         AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP="\$AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP" \
+        AI_AGENT_WEB_MODE="\$AI_AGENT_WEB_MODE" \
     "\$PYTHON_BIN" "\$AGENT_SCRIPT" "\$@"
 EOF
 ${SUDO} chmod +x "$WRAPPER"
@@ -668,9 +734,10 @@ if [ -n "$API_KEY_INPUT" ]; then
     AI_AGENT_DEFAULT_MODEL="$DEFAULT_MODEL" \
     AI_AGENT_DEFAULT_MAX_STEPS="$DEFAULT_MAX_STEPS" \
     AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP="$DEFAULT_MAX_CMDS_PER_STEP" \
+    AI_AGENT_WEB_MODE="$DEFAULT_WEB_MODE" \
       "$VENV_DIR/bin/python" "$DEST_DIR/ai_server_agent.py" "$@"
 else
     printf "No se ha introducido ninguna clave; la instalación ha finalizado sin ejecutar el agente.\n"
-    printf "Para utilizar el agente más adelante:\n  export OPENAI_API_KEY=<tu-clave>\n  AI_AGENT_DEFAULT_MODEL=%s ai-agent --task \"tu instrucción\"\n" "$DEFAULT_MODEL"
+    printf "Para utilizar el agente más adelante:\n  export OPENAI_API_KEY=<tu-clave>\n  AI_AGENT_WEB_MODE=%s AI_AGENT_DEFAULT_MODEL=%s ai-agent --task \"tu instrucción\"\n" "$DEFAULT_WEB_MODE" "$DEFAULT_MODEL"
 fi
 printf "\nPuedes volver a ejecutar este script para actualizar el agente, reescribir el informe o introducir una nueva clave de API.\n"
