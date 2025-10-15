@@ -1,669 +1,613 @@
-#!/bin/bash
-# install_ai_agent.sh - Deploy / Update the AI server agent on Debian 12/13+
-# Version: 1.4.0
-# Usage:
-#   sudo bash install_ai_agent.sh
-#
-# After install:
-#   ai-agent --task "muestra 'uname -a' y 'lsb_release -a'"
-#
-# Notas:
-# - Incluye auto-actualización desde UPDATE_URL si la versión remota es mayor.
-# - Crea /opt/ai-agent, virtualenv, y /usr/local/bin/ai-agent (wrapper).
-# - Gestión de API persistente en /etc/ai-agent/agent.env.
+#!/usr/bin/env bash
+# install_ai_agent.sh - One-shot installer/updater for AI Agent (Debian/Ubuntu)
+# Version metadata
+VERSION="1.9.0"
+PROJECT_NAME="ai-agent"
+INSTALL_DIR="/opt/ai-agent"
+PY_BIN="/usr/bin/python3"
+VENV_DIR="$INSTALL_DIR/.venv"
+WRAPPER="/usr/local/bin/ai-agent"
+SQL_HELPER="/usr/local/bin/ai-sql"
+STATE_DIR="/etc/ai-agent"
+ENV_FILE="$STATE_DIR/agent.env"
+REPORT_FILE="$INSTALL_DIR/report.md"
+AGENT_PY="$INSTALL_DIR/ai_server_agent.py"
+UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/Halk58/ai-agent-cli/main/install_ai_agent.sh"
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.8.0"
-# Auto-update URL (pedida por ti):
-UPDATE_URL="https://raw.githubusercontent.com/Halk58/ai-agent-cli/main/install_ai_agent.sh"
+log() { printf "[%(%Y-%m-%d %H:%M:%S)T] %s\n" -1 "$*" ; }
+info() { log "[INFO] $*"; }
+warn() { log "[WARN] $*"; }
+err()  { log "[ERROR] $*" >&2; }
 
-# ---- sudo helper ------------------------------------------------------------
-if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
-
-# ---- self-update ------------------------------------------------------------
-if [ -n "${UPDATE_URL:-}" ]; then
-  tmp_update="$(mktemp)"
-  if curl -fsSL "$UPDATE_URL" -o "$tmp_update"; then
-    remote_ver="$(grep -Eo 'SCRIPT_VERSION="[0-9.]+"' "$tmp_update" | head -n1 | cut -d'"' -f2 || true)"
-    if [ -n "$remote_ver" ]; then
-      newest="$(printf '%s\n%s\n' "$SCRIPT_VERSION" "$remote_ver" | sort -V | tail -n1)"
-      if [ "$newest" = "$remote_ver" ] && [ "$SCRIPT_VERSION" != "$remote_ver" ]; then
-        echo "[INFO] A newer version ($remote_ver) is available. Updating self from $UPDATE_URL ..."
-        script_path="$(readlink -f -- "$0")"
-        if [ -w "$script_path" ]; then
-          cp "$tmp_update" "$script_path"
-        else
-          ${SUDO} cp "$tmp_update" "$script_path"
-        fi
-        chmod +x "$script_path"
-        echo "[INFO] Re-executing the updated installer..."
-        exec "$script_path" "$@"
-      fi
-    fi
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    err "This installer must run as root."
+    exit 1
   fi
-  rm -f "$tmp_update" || true
-fi
+}
 
-# ---- packages ---------------------------------------------------------------
-echo "[INFO] Updating package lists..."
-${SUDO} apt-get update -y
-echo "[INFO] Installing Python and required packages..."
-${SUDO} apt-get install -y python3 python3-venv python3-pip ca-certificates curl git
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# ---- layout -----------------------------------------------------------------
-DEST_DIR="/opt/ai-agent"
-VENV_DIR="$DEST_DIR/venv"
-WRAPPER="/usr/local/bin/ai-agent"
-CONF_DIR="/etc/ai-agent"
-ENV_FILE="$CONF_DIR/agent.env"
+compare_versions() {
+  # prints 0 if equal, 1 if $1 > $2, 2 if $1 < $2
+  # simple dpkg-based compare if present, else fallback lexicographic
+  if have_cmd dpkg; then
+    if dpkg --compare-versions "$1" eq "$2"; then echo 0; return; fi
+    if dpkg --compare-versions "$1" gt "$2"; then echo 1; return; fi
+    echo 2; return
+  else
+    if [ "$1" = "$2" ]; then echo 0; return; fi
+    if [ "$1" \> "$2" ]; then echo 1; return; fi
+    echo 2; return
+  fi
+}
 
-echo "[INFO] Creating installation directory at $DEST_DIR"
-${SUDO} mkdir -p "$DEST_DIR" "$CONF_DIR"
+self_update() {
+  local url="${UPDATE_URL:-$UPDATE_URL_DEFAULT}"
+  # allow skipping update via env
+  if [ "${NO_SELF_UPDATE:-}" = "1" ]; then
+    info "NO_SELF_UPDATE=1, skipping self-update check."
+    return 0
+  fi
+  local tmp="/tmp/${PROJECT_NAME}-installer.$$"
+  if ! curl -fsSL "$url" -o "$tmp"; then
+    warn "Could not fetch update url: $url (continuing with local script)"
+    rm -f "$tmp" || true
+    return 0
+  fi
+  local remote_ver
+  remote_ver="$(grep -E '^VERSION=\"' \"$tmp\" | head -n1 | sed -E 's/^VERSION=\"([^\"]+)\".*/\1/')"
+  if [ -z "$remote_ver" ]; then
+    warn "Remote installer has no VERSION; skipping self-update."
+    rm -f "$tmp" || true
+    return 0
+  fi
+  local cmp
+  cmp=$(compare_versions "$remote_ver" "$VERSION")
+  if [ "$cmp" = "2" ] || [ "$cmp" = "0" ]; then
+    # remote <= local
+    rm -f "$tmp" || true
+    return 0
+  fi
+  info "A newer version ($remote_ver) is available. Updating self from $url ..."
+  chmod +x "$tmp" || true
+  info "Re-executing the updated installer..."
+  exec "$tmp" "$@"
+}
 
-# ---- write agent python -----------------------------------------------------
-echo "[INFO] Writing agent script to $DEST_DIR/ai_server_agent.py"
-${SUDO} tee "$DEST_DIR/ai_server_agent.py" >/dev/null <<'PYCODE'
+ensure_packages() {
+  info "Updating package lists..."
+  apt-get update -y >/dev/null || apt-get update -y
+  info "Installing Python and required packages..."
+  apt-get install -y python3 python3-venv python3-pip curl ca-certificates >/dev/null || apt-get install -y python3 python3-venv python3-pip curl ca-certificates
+}
+
+write_report() {
+  cat >"$REPORT_FILE" <<'EOF'
+# AI Agent (Server Automation)
+
+Esta máquina tiene instalado un agente de automatización por IA.
+
+## Archivos
+- Código del agente: `/opt/ai-agent/ai_server_agent.py`
+- Entorno virtual: `/opt/ai-agent/.venv`
+- Wrapper CLI: `/usr/local/bin/ai-agent`
+- Helper SQL: `/usr/local/bin/ai-sql`
+- Estado & API key: `/etc/ai-agent/agent.env` (si se guarda)
+- Este informe: `/opt/ai-agent/report.md`
+
+## Uso rápido
+```bash
+ai-agent --help
+ai-agent --task "muestra 'uname -a'"
+ai-agent --set-key sk-...    # guardar clave API
+ai-agent --show-key           # ver clave enmascarada
+ai-agent --clear-key          # borrar clave guardada
+```
+
+## Notas
+- El agente decide automáticamente cuándo usar búsqueda web (si está activado) y limita los comandos por paso con guías de seguridad.
+- `AI_AGENT_VERBOSE=1` añade trazas útiles, incluido el RAW devuelto por el modelo.
+EOF
+}
+
+write_python_agent() {
+  mkdir -p "$INSTALL_DIR"
+  cat >"$AGENT_PY" <<'PYEOF'
 #!/usr/bin/env python3
-# ai_server_agent.py - generic server automation agent
-# - Robust JSON parsing (sin JSON mode obligatorio)
-# - Fallback Responses API / Chat Completions (sin temperature)
-# - Max tokens seguro (max_completion_tokens)
-# - Verbose RAW opcional (AI_AGENT_VERBOSE=1)
-# - Evita bucles por respuestas vacías; reintenta y corta a la 3ª
-# - No reinyecta el JSON del asistente en cada paso (menos ruido)
-# - Normaliza comandos (no interactivo, gpg --batch, mysql defaults-file, etc.)
-# - Combina comandos por paso en script temporal (preserva variables)
-# - Detección mejorada de peligros; allowlist para limpiezas de APT
-# - Web-mode auto/on/off (transparente); solo se loguea si verbose
-import os, sys, re, json, time, shlex, tempfile, subprocess, argparse
-from typing import List, Dict, Tuple, Any, Optional
+# ai_server_agent.py - Chat-driven automation agent
+# - Verbose logging with timestamps
+# - Empty-output recovery
+# - No re-injection of assistant JSON per command
+# - Auto web-mode decision (off/on/auto) - only heuristic flag (actual web calls via shell/curl when needed)
+# - Generic DB access helper awareness via `ai-sql`
+import os, sys, json, subprocess, shlex, time, argparse, textwrap, math
+from datetime import datetime
 
-# ------------------- logging -------------------
-def now_ts() -> str:
-    return time.strftime("[%Y-%m-%d %H:%M:%S]")
-
-def log_info(msg: str) -> None:
-    print(f"{now_ts()} {msg}")
-
-def log_err(msg: str) -> None:
-    print(f"{now_ts()} {msg}", file=sys.stderr)
-
+# ---------- Config from env ----------
+DEFAULT_MODEL = os.getenv("AI_AGENT_DEFAULT_MODEL", "gpt-5-mini")
+DEFAULT_MAX_STEPS = int(os.getenv("AI_AGENT_DEFAULT_MAX_STEPS", "30"))
+DEFAULT_MAX_CMDS_PER_STEP = int(os.getenv("AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP", "24"))
+WEB_MODE = os.getenv("AI_AGENT_WEB_MODE", "auto").lower()  # auto|on|off
 VERBOSE = os.getenv("AI_AGENT_VERBOSE", "").lower() not in ("", "0", "false", "no")
+COST_PER_1K = float(os.getenv("AI_AGENT_COST_PER_1K_TOKENS", "0.0005"))  # rough default
+TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
-# ------------------- openai client -------------------
-# Compatible con openai>=1.0.0
-try:
-    from openai import OpenAI
-    _client = OpenAI()
-except Exception as e:
-    log_err("OpenAI client not available. Did you install 'openai' and set OPENAI_API_KEY?")
-    raise
+# OpenAI
+from openai import OpenAI
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-# ------------------- CLI -------------------
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="AI server agent for Debian automation")
-    p.add_argument("--task", type=str, help="Initial natural language instruction")
-    p.add_argument("--model", type=str, default=os.getenv("AI_AGENT_DEFAULT_MODEL","gpt-5-mini"))
-    p.add_argument("--max-steps", type=int, default=int(os.getenv("AI_AGENT_DEFAULT_MAX_STEPS","24")))
-    p.add_argument("--max-cmds", type=int, default=int(os.getenv("AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP","24")))
-    p.add_argument("--web-mode", choices=["auto","on","off"], default=os.getenv("AI_AGENT_WEB_MODE","auto"))
-    p.add_argument("--help-agent", action="store_true", help="Show agent help and exit")
-    return p.parse_args()
+def now():
+    return datetime.utcnow().strftime(TIME_FMT)
 
-# ------------------- helpers -------------------
-def is_tty() -> bool:
-    return sys.stdin.isatty()
+def log_info(msg):
+    print(f"[{now()}] {msg}", flush=True)
 
-def run(cmd: List[str], env: Optional[Dict[str,str]]=None, timeout: Optional[int]=None) -> Tuple[int,str,str]:
+def log_err(msg):
+    print(f"[{now()}] {msg}", file=sys.stderr, flush=True)
+
+def decide_web_mode(task_text: str) -> str:
+    if WEB_MODE in ("on", "off"):
+        return WEB_MODE
+    # Heurística simple: palabras clave indicativas de web
+    kw = ("noticias","news","precio","price","cotización","quote","último valor","latest","descarga","download","http","https","buscar","search")
+    t = task_text.lower()
+    for k in kw:
+        if k in t:
+            return "on"
+    return "off"
+
+def run_shell(cmd: str, timeout_sec: int = 600):
+    """Execute shell command, capture stdout/stderr, rc"""
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
-        return proc.returncode, proc.stdout, proc.stderr
-    except Exception as e:
-        return 1, "", str(e)
+        p = subprocess.run(cmd, shell=True, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec, executable="/bin/bash")
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired as e:
+        return 124, e.stdout or "", (e.stderr or "") + f"\nTIMEOUT after {timeout_sec}s"
 
-def run_shell(command: str, timeout: Optional[int]=None) -> Tuple[int,str,str]:
-    return run(["/bin/bash","-lc", command], timeout=timeout)
-
-def dangerous_command(cmd: str) -> bool:
-    s = cmd.strip()
-    low = s.lower()
-
-    # allowlist rm limpiezas legitimas
-    ALLOW_RM = [
-        "/var/lib/apt/lists/*",
-        "/var/cache/apt/archives/*",
-        "/tmp/*",
-        "/var/tmp/*",
-    ]
-    if re.search(r'^\s*rm\s+-rf\s+', s):
-        # si va contra /, bloquea; si es allowlist, permite
-        if re.search(r'^\s*rm\s+-rf\s+/\s*($|[#;&|\s])', s):
-            return True
-        if any(p in s for p in ALLOW_RM):
+def safe_command_line(c: str) -> bool:
+    bad = ("rm -rf /", ":(){:|:&};:", "mkfs", "dd if=/dev/zero of=", ">: /dev/sda", "shutdown -h", "reboot -f", "init 0")
+    lc = c.strip().lower()
+    for b in bad:
+        if b in lc:
             return False
-        # eliminar cosas arbitrarias fuera de allowlist: pedir al modelo que explique primero
-        return True
+    return True
 
-    blocked_patterns = [
-        r'\bmkfs(\.| )', r'\bwipefs\b', r'\bsfdisk\b', r'\bparted\b.+/dev/',
-        r'\bdd\s+if=/dev/', r'\bchattr\s+-i\s+/', r'\buserdel\s+-r\s+root\b',
-        r'\b(shutdown|reboot|halt)\b', r':\(\)\s*{\s*:\|\:&\s*};:',
-        r'\blvremove\b', r'\bvgremove\b', r'\bpvremove\b',
-    ]
-    for pat in blocked_patterns:
-        if re.search(pat, low):
-            return True
-    return False
+def build_system_prompt(web_flag: str) -> str:
+    # General, no casos específicos de servicios concretos; patrones reutilizables
+    return textwrap.dedent(f"""
+    Eres un agente de automatización en sistemas Debian/Ubuntu. Salida SIEMPRE en JSON válido:
+    {{"explanation": "...", "commands": ["cmd1","cmd2",...], "finished": false}}
+    Reglas:
+    - Propón comandos seguros y no destructivos. Prefiere 'install' a borrar.
+    - Agrupa pasos cuando ayude a coherencia, pero no sobrepases el límite indicado.
+    - Si no hay nada que hacer, establece finished=true.
+    - Limita comandos por paso (te diré el tope).
+    - Usa 'bash -lc' para scripts multilínea cuando haga falta.
+    - No uses 'apt-key'. Usa keyrings en /usr/share/keyrings + 'signed-by='.
+    - Antes de modificar ficheros en /etc/, haz copia (tar a /root/*-backup-TS.tar.gz o .bak).
+    - Cuando necesites inspección: muestra 'cat/grep' y 'systemctl status' sin interrumpir por errores (usa '|| true').
+    - Al consultar servicios de base de datos o similares, intenta un enfoque GENÉRICO y reutilizable:
+      * Para clientes SQL, intenta ejecutables genéricos disponibles y auto-descubrimiento de credenciales locales:
+        - Usa primero 'ai-sql ...' si existe (es un wrapper que intenta sockets/credenciales locales de forma segura).
+        - Si no existe 'ai-sql', intenta cliente nativo sin credenciales sensibles y con tolerancia a fallo:
+          mariadb -e "..." || mysql -e "..." || true
+      * Evita codificar contraseñas. Si se requiere, indica cómo se guardarían en un fichero de credenciales protegido.
+    - Manejo web: web-mode={web_flag}. Si está 'on', puedes proponer 'curl' o clientes CLI adecuados con timeouts y parseo robusto.
+    - Para outputs largos, resume. Evita verter ficheros enteros en salida.
+    - Responde SOLO con el JSON indicado.
+    """).strip()
 
-def normalize_command(cmd: str) -> str:
-    s = cmd.strip()
+def build_user_prompt(task: str, step: int, limits: dict) -> str:
+    return textwrap.dedent(f"""
+    Tarea del usuario: {task}
 
-    # apt-get: forzar no interactivo + -y en installs/upgrades
-    if re.search(r'^\s*apt(-get)?\s+(install|upgrade|dist-upgrade|full-upgrade)\b', s):
-        if "DEBIAN_FRONTEND" not in s:
-            s = f"DEBIAN_FRONTEND=noninteractive {s}"
-        if re.search(r'\sinstall\b', s) and " -y" not in s:
-            s = s.replace("install", "install -y", 1)
-        # opciones de dpkg seguras
-        if "Dpkg::Options::=" not in s:
-            s = s + " -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold'"
+    Paso actual: {step}
+    Límite de comandos por paso: {limits["max_cmds"]}
+    Formato de respuesta requerido (JSON estricto):
+    {{
+      "explanation": "breve explicación del objetivo del paso",
+      "commands": ["comando1", "comando2"],
+      "finished": false
+    }}
+    """).strip()
 
-    # curl: endurecer por defecto
-    if re.search(r'^\s*curl\b', s) and "-f" not in s and "--fail" not in s:
-        if "--silent" not in s and "-s" not in s:
-            s = s.replace("curl", "curl -fsS", 1)
-        else:
-            s = s.replace("curl", "curl -fS", 1)
-        if "--retry" not in s:
-            s = s + " --retry 2"
-        if "--max-time" not in s:
-            s = s + " --max-time 20"
+def openai_client():
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    return OpenAI(api_key=OPENAI_API_KEY)
 
-    # gpg --dearmor: evitar prompts
-    if "gpg" in s and "--dearmor" in s and "--batch" not in s:
-        s = s.replace("gpg ", "gpg --batch --yes ", 1)
-
-    # systemctl status: sin paginador
-    if re.search(r'^\s*systemctl\s+status\b', s) and "--no-pager" not in s:
-        s = s + " --no-pager"
-
-    # mysql/mariadb tools: usar defaults-file si existe y no hay credenciales
-    defaults = None
-    for cand in ("/etc/mysql/debian.cnf", "/root/.my.cnf"):
-        if os.path.isfile(cand):
-            defaults = cand
-            break
-    if defaults and re.search(r'^\s*(mysql|mariadb|mysqldump)\b', s):
-        if "--defaults-file" not in s and " -p" not in s and "--user" not in s:
-            # insertar justo después del binario
-            s = re.sub(r'^\s*(mysql|mariadb|mysqldump)\b', rf"\g<0> --defaults-file={defaults}", s, count=1)
-
-    return s
-
-def commands_to_script(commands: List[str]) -> str:
-    # normaliza cada línea y compone un script bash temporal
-    lines = []
-    for c in commands:
-        c = c.strip()
-        if not c:
-            continue
-        lines.append(normalize_command(c))
-    if not lines:
-        return ""
-    script = "#!/usr/bin/env bash\nset -euo pipefail\n"
-    script += "\n".join(lines) + "\n"
-    return script
-
-def exec_commands_as_script(commands: List[str]) -> Tuple[int,str,str]:
-    script = commands_to_script(commands)
-    if not script:
-        return 0, "", ""
-    with tempfile.NamedTemporaryFile("w", delete=False, prefix="ai-agent-step-", suffix=".sh") as f:
-        path = f.name
-        f.write(script)
-    os.chmod(path, 0o755)
-    rc, out, err = run(["/bin/bash", path])
+def call_model(messages, model, max_tokens=None):
+    client = openai_client()
+    # Usamos Chat Completions; evitamos pasar temperature/top_p para compatibilidad
     try:
-        os.unlink(path)
-    except Exception:
-        pass
-    return rc, out, err
-
-def extract_json_from_text(text: str) -> Optional[Dict[str,Any]]:
-    if not text:
-        return None
-    # intenta parsear todo
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    # busca el primer objeto {...} balanceado de forma simple
-    m = re.search(r'\{.*\}', text, flags=re.S)
-    if m:
-        blob = m.group(0)
-        try:
-            return json.loads(blob)
-        except Exception:
-            return None
-    return None
-
-def model_supports_responses(model: str) -> bool:
-    # Heurística amplia; si falla, caemos a chat completions
-    return any(model.lower().startswith(p) for p in ("gpt-5", "o4", "o3", "gpt-4o"))
-
-def call_openai(messages: List[Dict[str,str]], model: str,
-                web_mode: str,
-                max_completion_tokens: int = 2048) -> Tuple[Dict[str,Any], Dict[str,int]]:
-    usage = {"prompt_tokens": 0, "completion_tokens": 0}
-    content_text = ""
-
-    if model_supports_responses(model):
-        # Responses API
-        try:
-            # No usamos response_format para evitar errores de compatibilidad.
-            # Pedimos al modelo JSON via prompt; luego validamos aquí.
-            r = _client.responses.create(
-                model=model,
-                input=messages,
-                max_completion_tokens=max_completion_tokens
-            )
-            # extrae texto
-            text = ""
-            for out in r.output_text or []:
-                text += out
-            if not text and hasattr(r, "output_text"):
-                text = r.output_text
-            if VERBOSE:
-                log_info("RAW (responses) >>> " + (text[:1200].replace("\n"," ") if text else "<empty>"))
-            content_text = text or ""
-            # usage (si viene)
-            try:
-                usage["prompt_tokens"] = getattr(r.usage, "input_tokens", 0) or 0
-                usage["completion_tokens"] = getattr(r.usage, "output_tokens", 0) or 0
-            except Exception:
-                pass
-        except Exception as e:
-            log_err(f"Responses API failed ({type(e).__name__}): {e}. Falling back to Chat Completions.")
-            # fallback a chat completions
-            pass
-
-    if not content_text:
-        # Chat Completions fallback
-        try:
-            # No temperature, no response_format para compatibilidad amplia
-            comp = _client.chat.completions.create(
-                model=model,
-                messages=messages,
-                # algunos modelos no aceptan 'max_tokens'; otros sí. Mejor omitir.
-            )
-            content_text = comp.choices[0].message.content or ""
-            if VERBOSE:
-                log_info("RAW (chat) >>> " + (content_text[:1200].replace("\n"," ") if content_text else "<empty>"))
-            try:
-                usage["prompt_tokens"] = getattr(comp.usage, "prompt_tokens", 0) or 0
-                usage["completion_tokens"] = getattr(comp.usage, "completion_tokens", 0) or 0
-            except Exception:
-                pass
-        except Exception as exc:
-            raise RuntimeError(f"OpenAI API call failed: {exc}")
-
-    data = extract_json_from_text(content_text)
-    if not data:
-        # fuerza al modelo a responder con JSON válido en el siguiente turno
-        data = {}
-
-    return data, usage
-
-# ------------------- prompt -------------------
-def build_system_msg(web_mode: str) -> str:
-    # Instrucciones generales; SIN reglas específicas de MySQL.
-    return (
-        "You are a Linux server automation agent on Debian 12/13.\n"
-        "Translate user goals into safe shell commands. After each step, you see the outputs and decide the next step.\n"
-        "ALWAYS reply ONLY with a JSON object having EXACT keys: "
-        "{\"commands\": [\"...\"], \"explanation\": \"...\", \"finished\": true|false}.\n"
-        "Guidelines:\n"
-        "- Prefer non-interactive flags; avoid prompts (e.g. use --yes/--batch and noninteractive envs).\n"
-        "- Use Debian-appropriate commands; avoid interactive editors.\n"
-        "- If a previous command failed, do NOT repeat it unchanged; propose an alternative.\n"
-        "- Never suggest destructive operations.\n"
-        "- If information is missing, state the assumption or propose a safe probe command to gather it.\n"
-        "- If the task is already complete, set finished=true.\n"
-        f"- Web-mode is '{web_mode}'. If 'on' and you need current web info, plan accordingly; if 'off', avoid web. If 'auto', decide pragmatically.\n"
-    )
-
-# ------------------- main loop -------------------
-def main() -> None:
-    args = parse_args()
-    if args.help_agent:
-        print("Agent help:\n"
-              "  --task \"...\"                 Initial instruction\n"
-              "  --model NAME                  Model (default env AI_AGENT_DEFAULT_MODEL)\n"
-              "  --max-steps N                 Max reasoning steps per task\n"
-              "  --max-cmds N                  Max commands per step\n"
-              "  --web-mode auto|on|off        Web mode policy (metadata only)\n"
-              "ENV:\n"
-              "  AI_AGENT_VERBOSE=1            Show RAW model outputs and decisions\n"
-              "  AI_AGENT_DEFAULT_MODEL        Default model if --model omitted\n"
-              "  AI_AGENT_DEFAULT_MAX_STEPS    Default max steps\n"
-              "  AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP  Default max cmds per step\n"
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            # no temperature (algunos modelos no aceptan 0.0), no response_format
+            # max_tokens opcional: mejor omitir para compatibilidad amplia
         )
-        return
+    except Exception as e:
+        raise RuntimeError(f"OpenAI API call failed: {e}")
 
-    log_info("Agent starting (interactive).")
-    # Decide web-mode de forma transparente (solo lo mostramos si VERBOSE)
-    web_mode = args.web_mode
-    if web_mode not in ("auto","on","off"): web_mode = "auto"
+    usage = getattr(resp, "usage", None)
+    if usage:
+        pt = getattr(usage, "prompt_tokens", 0) or 0
+        ct = getattr(usage, "completion_tokens", 0) or 0
+    else:
+        pt = ct = 0
+
+    content = resp.choices[0].message.content if resp.choices else ""
     if VERBOSE:
-        log_info(f"web-mode: {web_mode}")
+        log_info("RAW >>> " + (content[:1600].replace("\n"," ") if content else "<empty>"))
+    return content, pt, ct
 
-    messages: List[Dict[str,str]] = []
-    messages.append({"role":"system","content": build_system_msg(web_mode)})
+def parse_model_json(text: str):
+    try:
+        # Busca el primer bloque JSON en el texto
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return {}
+        raw = text[start:end+1]
+        return json.loads(raw)
+    except Exception:
+        return {}
 
-    total_prompt = 0
-    total_completion = 0
+def estimate_cost(total_prompt, total_completion):
+    tokens = total_prompt + total_completion
+    return (tokens/1000.0) * COST_PER_1K
+
+def main():
+    parser = argparse.ArgumentParser(description="AI automation agent")
+    parser.add_argument("--task", help="Initial single task (non-interactive if provided)")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model to use (default env/installed)")
+    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
+    parser.add_argument("--max-cmds-per-step", type=int, default=DEFAULT_MAX_CMDS_PER_STEP)
+    parser.add_argument("--web-mode", default=WEB_MODE, choices=["auto","on","off"])
+    parser.add_argument("--help-agent", action="store_true", help="Show agent help")
+    args = parser.parse_args()
+
+    if args.help_agent:
+        print(textwrap.dedent(f"""
+        Agent help
+        ==========
+        Environment:
+          OPENAI_API_KEY             required
+          AI_AGENT_DEFAULT_MODEL     default model (current: {DEFAULT_MODEL})
+          AI_AGENT_DEFAULT_MAX_STEPS default max steps (current: {DEFAULT_MAX_STEPS})
+          AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP default max cmds per step (current: {DEFAULT_MAX_CMDS_PER_STEP})
+          AI_AGENT_WEB_MODE          auto|on|off (current: {WEB_MODE})
+          AI_AGENT_VERBOSE           1 enables raw debug logs
+
+        Usage examples:
+          ai-agent --task "muestra 'uname -a'"
+          ai-agent --model gpt-5-mini
+        """).strip())
+        return 0
+
+    interactive = not bool(args.task)
+    print(f"[{now()}] Agent starting ({'interactive' if interactive else 'one-shot'}).")
 
     while True:
-        if args.task:
-            task = args.task.strip()
-            args.task = None
-        else:
+        if interactive:
             try:
                 task = input("Enter task (or press Enter to exit): ").strip()
             except EOFError:
+                task = ""
+            if not task:
+                print(f"[{now()}] Exiting interactive session.")
                 break
-        if not task:
-            print("Exiting interactive session.")
-            break
+        else:
+            task = args.task.strip()
+            if not task:
+                log_err("No task provided.")
+                return 1
 
-        messages.append({"role":"user","content": task})
-        idle_empty = 0  # respuestas vacías seguidas
+        web_flag = decide_web_mode(task)
+        print(f"[{now()}] web-mode: {web_flag}")
+
+        messages = []
+        sys_prompt = build_system_prompt(web_flag)
+        messages.append({"role": "system", "content": sys_prompt})
+        user_prompt = build_user_prompt(task, step=1, limits={"max_cmds": args.max_cmds_per_step})
+        messages.append({"role": "user", "content": user_prompt})
+
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+
         finished = False
-
         for step in range(1, args.max_steps+1):
-            log_info(f"=== Step {step} ===")
-            try:
-                data, usage = call_openai(messages, args.model, web_mode)
-            except Exception as e:
-                log_err(f"Error durante llamada API: {e}")
-                break
+            print(f"[{now()}] === Step {step} ===")
+            text, pt, ct = call_model(messages, args.model)
+            total_prompt_tokens += pt
+            total_completion_tokens += ct
 
-            total_prompt += usage.get("prompt_tokens", 0)
-            total_completion += usage.get("completion_tokens", 0)
-
-            commands = data.get("commands", [])
-            explanation = (data.get("explanation", "") or "").strip()
+            data = parse_model_json(text)
+            explanation = (data.get("explanation") or "").strip()
+            commands = data.get("commands") or []
             finished_flag = bool(data.get("finished", False))
 
+            # Robust empty/invalid handling
             if (not commands) and (explanation == "") and not finished_flag:
-                idle_empty += 1
-                log_err("Modelo devolvió JSON vacío. Reintentando con recordatorio estricto.")
-                messages.append({"role":"user","content":
-                    "La respuesta anterior estaba vacía. Responde SOLO con JSON válido con las claves EXACTAS: "
-                    "{\"commands\": [\"...\"], \"explanation\": \"...\", \"finished\": true|false}. "
-                    "Incluye al menos un comando seguro o marca finished=true si ya has terminado."
+                # ask model to provide at least one command or finish
+                messages.append({
+                    "role": "user",
+                    "content": "Tu respuesta anterior estaba vacía. Devuelve JSON con 'explanation', 'commands' (>=1) o 'finished': true. SOLO JSON."
                 })
-                if idle_empty >= 3:
-                    log_err("Tres respuestas vacías seguidas. Abortando esta tarea para evitar bucle.")
-                    break
-                continue
+                text, pt, ct = call_model(messages, args.model)
+                total_prompt_tokens += pt
+                total_completion_tokens += ct
+                data = parse_model_json(text)
+                explanation = (data.get("explanation") or "").strip()
+                commands = data.get("commands") or []
+                finished_flag = bool(data.get("finished", False))
 
             if explanation:
-                log_info(f"AI explanation: {explanation}")
-
-            # limitar comandos
-            if isinstance(commands, list):
-                if len(commands) > args.max_cmds:
-                    log_info(f"Limiting commands from {len(commands)} to {args.max_cmds}")
-                    commands = commands[:args.max_cmds]
-            else:
-                commands = []
-
-            # filtrar peligrosos
-            safe_cmds: List[str] = []
-            blocked: List[str] = []
-            for c in commands:
-                if dangerous_command(c):
-                    blocked.append(c)
-                else:
-                    safe_cmds.append(c)
-
-            if blocked:
-                messages.append({"role":"user","content":
-                    "Se bloquearon comandos peligrosos por seguridad:\n" + "\n".join(blocked) +
-                    "\nProporciona alternativas seguras o explica cómo proceder sin acciones destructivas."
-                })
-                # seguimos con los seguros (si hay)
-            if not safe_cmds and not finished_flag:
-                # sin comandos que ejecutar
-                messages.append({"role":"user","content":
-                    "No hay comandos seguros que ejecutar. Propón otra estrategia segura o marca finished=true si no hay nada más que hacer."
-                })
-                continue
-
-            if finished_flag and not safe_cmds:
-                finished = True
-                break
-
-            # Ejecutar como script para preservar entorno entre líneas
-            rc, out, err = exec_commands_as_script(safe_cmds)
-            if out:
-                print("-- STDOUT --")
-                print(out.rstrip())
-            if err:
-                print("-- STDERR --", file=sys.stderr)
-                print(err.rstrip(), file=sys.stderr)
-
-            # Añadir SOLO el resumen de ejecución (no reinyectar el JSON del asistente)
-            out_summary = f"Commands:\n" + "\n".join(f"$ {c}" for c in safe_cmds) + \
-                          f"\nReturn code: {rc}\nSTDOUT:\n{out}\nSTDERR:\n{err}"
-            messages.append({"role":"user","content": out_summary})
-
-            if rc != 0:
-                # sugerir reconsideración
-                messages.append({"role":"user","content":
-                    "El retorno fue distinto de 0. No repitas el mismo comando; analiza el error y propone otra vía."
-                })
+                print(f"[{now()}] AI explanation: {explanation}")
+            if commands:
+                print(f"[{now()}] Proposed commands:")
+                for c in commands[:args.max_cmds_per_step]:
+                    print(f"  $ {c}")
 
             if finished_flag:
+                print(f"[{now()}] Task complete.")
+                print("Summary:")
+                print(explanation or "Finished.")
                 finished = True
                 break
 
-        if finished:
-            log_info("Task complete.")
-        else:
-            log_info("Task finished (loop ended).")
+            # Execute commands
+            any_executed = False
+            for idx, cmd in enumerate(commands[:args.max_cmds_per_step], start=1):
+                if not safe_command_line(cmd):
+                    log_err(f"Blocked dangerous command: {cmd}")
+                    continue
+                rc, out, err = run_shell(cmd)
+                any_executed = True
+                print(f"[{now()}] Executing command {idx}/{min(len(commands), args.max_cmds_per_step)}: {cmd}")
+                if out.strip():
+                    print("-- STDOUT --")
+                    print(out.rstrip())
+                if err.strip():
+                    print("-- STDERR --")
+                    print(err.rstrip())
+                print(f"[{now()}] cmd='{cmd}' rc={rc}")
+                # summarize back
+                out_summary = f"Command: {cmd}\nReturn code: {rc}\nSTDOUT:\n{out}\nSTDERR:\n{err}"
+                messages.append({"role": "user", "content": out_summary})
 
-    if (total_prompt or total_completion):
-        # estimación muy aproximada
-        pricing = {
-            "gpt-5-mini": {"input": 0.00013, "output": 0.00052},  # EJEMPLO; ajústalo según tu cuenta
-            "gpt-4o": {"input": 0.0025, "output": 0.01},
-            "gpt-4o-mini": {"input": 0.00015, "output": 0.0003},
-        }
-        mk = args.model.lower()
-        if mk in pricing:
-            rates = pricing[mk]
-            cost = (total_prompt * rates["input"] + total_completion * rates["output"]) / 1000.0
-            print(f"\nApproximate API usage (chat): prompt_tokens={total_prompt}, completion_tokens={total_completion}.")
-            print(f"Estimated cost for model '{args.model}': ${cost:.4f} (USD)")
-        else:
-            print(f"\nApproximate API usage (chat): prompt_tokens={total_prompt}, completion_tokens={total_completion}.")
-            print(f"No pricing table for model '{args.model}'.")
+            if any_executed:
+                messages.append({"role": "user", "content": f"Proporciona el siguiente plan. Límite {args.max_cmds_per_step} comandos. JSON solo."})
+            else:
+                messages.append({"role": "user", "content": "No se ejecutó ningún comando. Ofrece un plan alternativo o finished=true. JSON solo."})
+
+        print(f"\n[{now()}] Approximate API usage (chat): prompt_tokens={total_prompt_tokens}, completion_tokens={total_completion_tokens}.")
+        cost = estimate_cost(total_prompt_tokens, total_completion_tokens)
+        print(f"[{now()}] Estimated cost for model '{args.model}': ${cost:.4f} (USD)")
+
+        if not interactive:
+            break
+
+    return 0
+
 if __name__ == "__main__":
-    main()
-PYCODE
-${SUDO} chmod 644 "$DEST_DIR/ai_server_agent.py"
+    try:
+        sys.exit(main())
+    except Exception as e:
+        log_err(f"Fatal error: {e}")
+        sys.exit(1)
+PYEOF
+  chmod +x "$AGENT_PY"
+}
 
-# ---- (opcional) breve informe ----------------------------------------------
-echo "[INFO] Writing report to $DEST_DIR/report.md"
-${SUDO} tee "$DEST_DIR/report.md" >/dev/null <<'REPORT'
-# AI Agent (Debian)
-- Respuestas vacías: detectadas, reintenta y corta a la 3ª (evita bucles).
-- Historial limpio: no reinyecta el JSON del asistente por cada comando.
-- Verbose RAW: `AI_AGENT_VERBOSE=1` imprime el bruto que devuelve el modelo.
-- Normalización de comandos:
-  - `apt-get`: no interactivo + banderas Dpkg seguras.
-  - `curl`: `-fS --retry 2 --max-time 20` si falta.
-  - `gpg --dearmor`: `--batch --yes` para evitar prompts.
-  - `systemctl status`: `--no-pager`.
-  - `mysql/mariadb/mysqldump`: añade `--defaults-file` si hay credenciales estándar.
-- Ejecución por paso como script temporal (preserva variables).
-- Detector de peligros mejorado; allowlist para limpiezas de APT.
-- Web-mode `auto|on|off`; decisión transparente.
-REPORT
-${SUDO} chmod 644 "$DEST_DIR/report.md"
-
-# ---- virtualenv & deps ------------------------------------------------------
-if [ ! -d "$VENV_DIR" ]; then
-  echo "[INFO] Creating virtual environment..."
-  ${SUDO} python3 -m venv "$VENV_DIR"
-fi
-echo "[INFO] Installing Python dependencies into the virtual environment..."
-${SUDO} "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
-# openai 1.x (Responses API) + typing-extensions (por compat)
-${SUDO} "$VENV_DIR/bin/pip" install --no-cache-dir "openai>=1.50.0" >/dev/null
-
-# ---- wrapper ---------------------------------------------------------------
-echo "[INFO] Creating wrapper executable $WRAPPER"
-${SUDO} tee "$WRAPPER" >/dev/null <<'WRAP'
+write_sql_helper() {
+  cat >"$SQL_HELPER" <<'EOF'
 #!/usr/bin/env bash
-# ai-agent wrapper
+# ai-sql: generic helper for local MariaDB/MySQL access without hardcoding secrets.
+set -euo pipefail
+# Try safest options first
+if [ -r /etc/mysql/debian.cnf ]; then
+  exec /usr/bin/mariadb --defaults-file=/etc/mysql/debian.cnf "$@"
+fi
+# Socket root without password (common on Debian/MariaDB)
+if command -v mariadb >/dev/null 2>&1; then
+  exec /usr/bin/mariadb -uroot "$@"
+fi
+if command -v mysql >/dev/null 2>&1; then
+  exec /usr/bin/mysql -uroot "$@"
+fi
+echo "ai-sql: no suitable local credentials found. Provide --user/--password or create /etc/mysql/debian.cnf" >&2
+exit 1
+EOF
+  chmod +x "$SQL_HELPER"
+}
 
+write_wrapper() {
+  cat >"$WRAPPER" <<'BASHWRAP'
+#!/usr/bin/env bash
+# ai-agent - wrapper for the Python AI automation agent
 set -euo pipefail
 
-CONF_DIR="/etc/ai-agent"
-ENV_FILE="$CONF_DIR/agent.env"
-AGENT_DIR="/opt/ai-agent"
-VENV_DIR="$AGENT_DIR/venv"
-PY="$VENV_DIR/bin/python"
-AGENT="$AGENT_DIR/ai_server_agent.py"
+INSTALL_DIR="/opt/ai-agent"
+VENV_DIR="$INSTALL_DIR/.venv"
+AGENT="$INSTALL_DIR/ai_server_agent.py"
+STATE_DIR="/etc/ai-agent"
+ENV_FILE="$STATE_DIR/agent.env"
 
-default_model="${AI_AGENT_DEFAULT_MODEL:-gpt-5-mini}"
-default_max_steps="${AI_AGENT_DEFAULT_MAX_STEPS:-24}"
-default_max_cmds="${AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP:-24}"
-default_web_mode="${AI_AGENT_WEB_MODE:-auto}"
+DEFAULT_MODEL="${AI_AGENT_DEFAULT_MODEL:-gpt-5-mini}"
+DEFAULT_MAX_STEPS="${AI_AGENT_DEFAULT_MAX_STEPS:-30}"
+DEFAULT_MAX_CMDS="${AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP:-24}"
+DEFAULT_WEB_MODE="${AI_AGENT_WEB_MODE:-auto}"
 
 usage() {
-  cat <<EOF
-ai-agent - Ejecuta el agente de automatización para Debian
+  cat <<'EOF'
+ai-agent - Ejecuta el agente de automatización para Debian/Ubuntu
 
 Uso:
   ai-agent [opciones del agente] --task "instrucción"
-  ai-agent --set-key [API_KEY]     # Guarda la API en $ENV_FILE
+  ai-agent --set-key [API_KEY]     # Guarda la API en /etc/ai-agent/agent.env
   ai-agent --clear-key             # Borra la API persistida
   ai-agent --show-key              # Muestra la API (enmascarada)
-  ai-agent --help-agent            # Ayuda del agente Python
-  ai-agent -h | --help             # Ayuda del wrapper
+  ai-agent -h | --help             # Ayuda del wrapper (no requiere API)
 
 Notas:
 - Si OPENAI_API_KEY no está en el entorno, el wrapper intentará cargarla desde
-  $ENV_FILE y, si hay TTY, permitirá introducirla y guardarla.
+  /etc/ai-agent/agent.env y, si hay TTY, la pedirá e incluso permitirá guardarla.
 - Variables por defecto:
-  AI_AGENT_DEFAULT_MODEL (por defecto: $default_model)
-  AI_AGENT_DEFAULT_MAX_STEPS ($default_max_steps)
-  AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP ($default_max_cmds)
-  AI_AGENT_WEB_MODE ($default_web_mode)
-- Verbosidad: export AI_AGENT_VERBOSE=1 para debug detallado.
+  AI_AGENT_DEFAULT_MODEL (por defecto: gpt-5-mini)
+  AI_AGENT_DEFAULT_MAX_STEPS (30)
+  AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP (24)
+  AI_AGENT_WEB_MODE (auto|on|off; por defecto auto)
+- Para ver ayuda del agente Python:
+  ai-agent --help-agent
 EOF
 }
 
 mask() {
-  local x="${1:-}"
-  if [ -z "$x" ]; then echo "(no-set)"; return; fi
-  local len=${#x}
-  if [ $len -le 6 ]; then echo "******"; else echo "${x:0:3}******${x: -3}"; fi
+  local s="$1"
+  if [ -z "$s" ]; then echo "(empty)"; return; fi
+  local n=${#s}
+  if [ $n -le 8 ]; then echo "********"; return; fi
+  local head="${s:0:4}"
+  local tail="${s:(-4)}"
+  printf "%s********%s\n" "$head" "$tail"
 }
 
-ensure_key() {
-  if [ -n "${OPENAI_API_KEY:-}" ]; then return 0; fi
-  if [ -f "$ENV_FILE" ]; then
+ensure_envdir() { mkdir -p "$STATE_DIR"; chmod 0755 "$STATE_DIR"; }
+
+set_key() {
+  ensure_envdir
+  local key="${1:-}"
+  if [ -z "$key" ]; then
+    if [ -t 0 ]; then
+      read -r -s -p "Introduce tu OPENAI_API_KEY: " key
+      echo
+    else
+      echo "No API key provided and no TTY to prompt." >&2
+      exit 1
+    fi
+  fi
+  echo "OPENAI_API_KEY=$key" > "$ENV_FILE"
+  chmod 0600 "$ENV_FILE"
+  echo "[OK] Clave guardada en $ENV_FILE"
+}
+
+clear_key() {
+  rm -f "$ENV_FILE"
+  echo "[OK] Clave eliminada (si existía)"
+}
+
+show_key() {
+  if [ -r "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    echo "OPENAI_API_KEY=$(mask "${OPENAI_API_KEY:-}")"
+  else
+    echo "No hay clave persistida en $ENV_FILE"
+  fi
+}
+
+load_key_if_missing() {
+  if [ -n "${OPENAI_API_KEY:-}" ]; then return; fi
+  if [ -r "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
     . "$ENV_FILE"
     export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
   fi
   if [ -z "${OPENAI_API_KEY:-}" ] && [ -t 0 ]; then
-    read -r -p "Introduce tu OPENAI_API_KEY (deja en blanco para cancelar): " key || true
-    if [ -n "${key:-}" ]; then
-      OPENAI_API_KEY="$key"
-      read -r -p "¿Quieres guardarla en $ENV_FILE para futuros usos? [y/N]: " ans || true
-      if [[ "${ans,,}" == "y" ]]; then
-        mkdir -p "$CONF_DIR"
-        umask 077
-        printf 'OPENAI_API_KEY=%q\n' "$OPENAI_API_KEY" > "$ENV_FILE"
-        echo "[OK] Clave guardada en $ENV_FILE"
-      fi
-      export OPENAI_API_KEY
+    read -r -s -p "Introduce tu clave OpenAI API (se ocultará, deja en blanco para omitir): " k
+    echo
+    if [ -n "$k" ]; then
+      export OPENAI_API_KEY="$k"
+      read -r -p "¿Quieres guardarla en $ENV_FILE para futuros usos? [y/N]: " ans
+      ans="${ans:-N}"
+      case "$ans" in
+        y|Y) set_key "$k" ;;
+        *) ;;
+      esac
     fi
   fi
-  if [ -z "${OPENAI_API_KEY:-}" ]; then
-    echo "[ERR] OPENAI_API_KEY no disponible." >&2
-    exit 1
-  fi
-}
-
-set_key() {
-  local val="${1:-}"
-  if [ -z "$val" ] && [ -t 0 ]; then
-    read -r -p "Introduce tu OPENAI_API_KEY: " val || true
-  fi
-  if [ -z "$val" ]; then
-    echo "[ERR] No se proporcionó clave." >&2; exit 1
-  fi
-  mkdir -p "$CONF_DIR"; umask 077
-  printf 'OPENAI_API_KEY=%q\n' "$val" > "$ENV_FILE"
-  echo "[OK] Clave guardada en $ENV_FILE"
-}
-
-show_key() {
-  if [ -f "$ENV_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$ENV_FILE"
-    echo "OPENAI_API_KEY=$(mask "${OPENAI_API_KEY:-}")"
-  else
-    echo "OPENAI_API_KEY=(no-set)"
-  fi
-}
-
-clear_key() {
-  if [ -f "$ENV_FILE" ]; then rm -f "$ENV_FILE"; echo "[OK] Borrada $ENV_FILE"; else echo "Nada que borrar."; fi
 }
 
 if [ $# -gt 0 ]; then
   case "$1" in
-    -h|--help) usage; exit 0 ;;
-    --help-agent) ensure_key; exec "$PY" "$AGENT" --help-agent ;;
     --set-key) shift; set_key "${1:-}"; exit 0 ;;
-    --show-key) show_key; exit 0 ;;
     --clear-key) clear_key; exit 0 ;;
+    --show-key) show_key; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
   esac
 fi
 
-ensure_key
-exec "$PY" "$AGENT" "$@"
-WRAP
-${SUDO} chmod +x "$WRAPPER"
+load_key_if_missing
 
-echo "[SUCCESS] Installation complete."
-echo
-
-# ---- post-install key prompt (solo si hay TTY) ------------------------------
-if [ -t 0 ]; then
-  read -r -p "¿Quieres guardar ahora tu OPENAI_API_KEY para futuros usos? [y/N]: " ans || true
-  if [[ "${ans,,}" == "y" ]]; then
-    read -r -p "Introduce tu OPENAI_API_KEY: " KEY || true
-    if [ -n "${KEY:-}" ]; then
-      ${SUDO} mkdir -p "$CONF_DIR"
-      umask 077
-      echo "OPENAI_API_KEY=$(printf '%q' "$KEY")" | ${SUDO} tee "$ENV_FILE" >/dev/null
-      ${SUDO} chmod 600 "$ENV_FILE"
-      echo "[OK] Clave guardada en $ENV_FILE"
-    fi
-  fi
-  echo
+if [ ! -x "$AGENT" ]; then
+  echo "[ERROR] No se encuentra $AGENT. Reinstala el agente." >&2
+  exit 1
+fi
+if [ ! -x "$VENV_DIR/bin/python3" ]; then
+  echo "[ERROR] Entorno virtual no encontrado en $VENV_DIR. Reinstala el agente." >&2
+  exit 1
 fi
 
-echo "Listo. Prueba ahora:"
-echo "  ai-agent --task \"muestra 'uname -a' y 'lsb_release -a'\""
-echo "  AI_AGENT_VERBOSE=1 ai-agent --task \"actualiza el sistema\""
+exec "$VENV_DIR/bin/python3" "$AGENT" "$@"
+BASHWRAP
+  chmod +x "$WRAPPER"
+}
+
+create_venv_and_deps() {
+  info "Creating virtual environment..."
+  mkdir -p "$INSTALL_DIR"
+  if [ ! -x "$VENV_DIR/bin/python3" ]; then
+    "$PY_BIN" -m venv "$VENV_DIR"
+  fi
+  info "Installing Python dependencies into the virtual environment..."
+  "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
+  # Keep deps minimal for reliability
+  "$VENV_DIR/bin/pip" install --upgrade openai >/dev/null
+}
+
+persist_key_prompt_post_install() {
+  if [ -t 0 ]; then
+    echo
+    read -r -p "¿Quieres guardar ahora tu OPENAI_API_KEY para futuros usos? [y/N]: " ans
+    ans="${ans:-N}"
+    if [[ "$ans" =~ ^[yY]$ ]]; then
+      ensure_state_dir
+      read -r -s -p "Introduce tu OPENAI_API_KEY: " key
+      echo
+      echo "OPENAI_API_KEY=$key" > "$ENV_FILE"
+      chmod 0600 "$ENV_FILE"
+      echo "[OK] Clave guardada en $ENV_FILE"
+      echo
+      echo "Listo. Prueba ahora:"
+      echo "  ai-agent --help-agent"
+      echo "  ai-agent --task \"muestra 'uname -a' y 'lsb_release -a'\""
+    fi
+  fi
+}
+
+ensure_state_dir() { mkdir -p "$STATE_DIR"; chmod 0755 "$STATE_DIR"; }
+
+main() {
+  need_root
+  self_update "$@"
+  ensure_packages
+  mkdir -p "$INSTALL_DIR"
+  ensure_state_dir
+  info "Creating installation directory at $INSTALL_DIR"
+  write_python_agent
+  info "Writing agent script to $AGENT_PY"
+  write_report
+  info "Writing report to $REPORT_FILE"
+  create_venv_and_deps
+  write_wrapper
+  write_sql_helper
+  info "Creating wrapper executable $WRAPPER"
+  echo "[SUCCESS] Installation complete."
+  persist_key_prompt_post_install || true
+}
+
+main "$@"
