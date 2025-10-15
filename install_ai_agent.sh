@@ -11,21 +11,15 @@
 #   sudo bash install_ai_agent.sh
 #
 # After running this script you can invoke the agent with:
-#   OPENAI_API_KEY=<your-api-key> ai-agent --task "update the system"
+#   ai-agent --task "update the system"
 #
 set -euo pipefail
 
 # ========= User-tunable defaults =========
-# Default model for the agent if none is specified at runtime.
-# You can override at launch with: AI_AGENT_DEFAULT_MODEL="gpt-4o" ai-agent ...
-DEFAULT_MODEL="gpt-5-mini"
-
-# Higher defaults for complex tasks
+DEFAULT_MODEL="gpt-5-mini"          # Override per run: AI_AGENT_DEFAULT_MODEL="gpt-4o" ai-agent ...
 DEFAULT_MAX_STEPS=24
 DEFAULT_MAX_CMDS_PER_STEP=24
-
-# Web search decision mode: auto|on|off
-DEFAULT_WEB_MODE="auto"
+DEFAULT_WEB_MODE="auto"             # auto|on|off
 
 # ===== Pre-flight: require root or sudo =====
 if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
@@ -44,12 +38,11 @@ if command -v flock >/dev/null 2>&1; then
 fi
 
 # Versioning and update mechanism
-SCRIPT_VERSION="1.3.2"
-# Auto-update points to your published script URL
+SCRIPT_VERSION="1.3.3"
 UPDATE_URL="https://raw.githubusercontent.com/Halk58/ai-agent-cli/main/install_ai_agent.sh"
 
-# Determine whether sudo is available.  Some minimal containers do not have sudo installed.
-if command -v sudo >/devnull 2>&1; then
+# Determine whether sudo is available. Some minimal containers do not have sudo installed.
+if command -v sudo >/dev/null 2>&1; then
     SUDO="sudo"
 else
     SUDO=""
@@ -69,9 +62,7 @@ if [ -n "$UPDATE_URL" ]; then
         tmp_update_file="$(mktemp)"
         cleanup_update_tmp() { rm -f "$tmp_update_file"; }
         trap cleanup_update_tmp EXIT
-        # Add no-cache header and short timeout to avoid stale caches
         if curl -fsSL --connect-timeout 5 -m 15 -H 'Cache-Control: no-cache' "$UPDATE_URL" -o "$tmp_update_file"; then
-            # Extract remote version from the downloaded file
             remote_version="$(grep -Eo 'SCRIPT_VERSION=\"?[0-9]+\.[0-9]+\.[0-9]+\"?' "$tmp_update_file" | head -n1 | grep -Eo '([0-9]+\.){2}[0-9]+')"
             if [ -n "$remote_version" ]; then
                 newest_version="$(printf '%s\n%s' "$SCRIPT_VERSION" "$remote_version" | sort -V | tail -n1)"
@@ -105,6 +96,8 @@ ${SUDO} apt-get install -y python3 python3-venv python3-pip
 DEST_DIR="/opt/ai-agent"
 echo "[INFO] Creating installation directory at $DEST_DIR"
 ${SUDO} mkdir -p "$DEST_DIR"
+${SUDO} mkdir -p /etc/ai-agent
+${SUDO} chmod 755 /etc/ai-agent
 
 # Generate the Python agent script in the destination directory
 echo "[INFO] Writing agent script to $DEST_DIR/ai_server_agent.py"
@@ -121,6 +114,7 @@ General hardened agent with optional **Web Search (Responses API)**:
   model or library doesn't support it, gracefully falls back to offline mode.
 - Safer dangerous-command detector (tokenized), batching for stateful steps,
   and context-aware retries for APT.
+- Robust interactive input: if stdin is not a TTY, tries /dev/tty; if no TTY, exits with a clear message.
 """
 
 import argparse
@@ -170,9 +164,7 @@ def run_shell_command(command: str, timeout: int = 900) -> Tuple[int, str, str]:
 
 
 # --- Dangerous command detection (tokenized) ---
-SAFE_RM_PATTERNS = {
-    "/var/lib/apt/lists/*",  # apt cache cleanup (allowed)
-}
+SAFE_RM_PATTERNS = {"/var/lib/apt/lists/*"}
 
 def _tokenize(cmd: str) -> List[str]:
     try:
@@ -348,7 +340,7 @@ def web_autoplan(task: str, model: str, mode: str) -> str:
 def log(msg: str, log_file: str = "") -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line)
+    print(line, flush=True)
     if log_file:
         try:
             with open(log_file, "a", encoding="utf-8") as f:
@@ -357,16 +349,30 @@ def log(msg: str, log_file: str = "") -> None:
             pass
 
 
+def tty_input(prompt: str) -> str:
+    """Read a line from stdin; if not a TTY, try /dev/tty; if no TTY, return empty string."""
+    try:
+        if sys.stdin and sys.stdin.isatty():
+            return input(prompt)
+        # try /dev/tty
+        with open("/dev/tty", "r", encoding="utf-8", errors="ignore") as tty:
+            print(prompt, end="", flush=True)
+            return tty.readline().rstrip("\n")
+    except EOFError:
+        return ""
+    except Exception:
+        return ""
+
+
 def apt_context_signature() -> str:
     """Signature of APT context; changes when sources/keys change (used for smart retries)."""
     paths = ["/etc/apt/sources.list"]
-    paths += sorted(glob("/etc/apt/sources.list.d/*.list"))
-    paths += sorted(glob("/etc/apt/trusted.gpg.d/*.gpg"))
+    paths.extend(sorted(glob("/etc/apt/sources.list.d/*.list")))
+    paths.extend(sorted(glob("/etc/apt/trusted.gpg.d/*.gpg")))
     sig_parts = []
     for p in paths:
         try:
             st = os.stat(p)
-            # FIX: remove stray '}' in f-string
             sig_parts.append(f"{p}:{int(st.st_mtime)}:{st.st_size}")
         except FileNotFoundError:
             sig_parts.append(f"{p}:absent")
@@ -407,23 +413,24 @@ def main() -> None:
     parser.add_argument("--web", type=str, default=DEFAULT_WEB_MODE, choices=["auto","on","off"], help="Enable web search via Responses API: auto|on|off (default: auto)")
     args = parser.parse_args()
 
+    # Unbuffered output for immediate prompts/logs
+    os.environ["PYTHONUNBUFFERED"] = "1"
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print("Error: OPENAI_API_KEY no está definida. Exporta tu clave antes de ejecutar.", file=sys.stderr)
+        print("Error: OPENAI_API_KEY no está definida. Exporta tu clave o usa 'ai-agent --set-key'.", file=sys.stderr, flush=True)
         sys.exit(1)
+
+    print("[INFO] Agent starting (interactive).", flush=True)
 
     messages: List[Dict[str, str]] = []
     messages.append({"role": "system", "content": build_system_prompt()})
 
-    # One-off web context
     from typing import Optional
     pending_task: Optional[str] = args.task if args.task else None
     intro_task = pending_task
     if intro_task is None:
-        try:
-            intro_task = input("Enter initial task to decide web-search (press Enter to skip): ").strip() or None
-        except KeyboardInterrupt:
-            intro_task = None
+        intro_task = tty_input("Enter initial task to decide web-search (press Enter to skip): ").strip() or None
     if intro_task:
         web_context = web_autoplan(intro_task, args.model, args.web)
         if web_context:
@@ -441,17 +448,10 @@ def main() -> None:
             user_task = pending_task.strip()
             pending_task = None
         else:
-            try:
-                user_task = input("Enter next task (or press Enter to exit): ").strip()
-            except KeyboardInterrupt:
-                print("\nOperation cancelled by user.")
+            user_task = tty_input("Enter next task (or press Enter to exit): ").strip()
+            if not user_task:
+                print("Exiting interactive session.", flush=True)
                 break
-            if not user_task or user_task.lower() in {"exit", "quit", "q"}:
-                print("Exiting interactive session.")
-                break
-        if not user_task:
-            print("No task provided. Skipping.")
-            continue
 
         messages.append({"role": "user", "content": user_task})
         finished = False
@@ -461,14 +461,14 @@ def main() -> None:
             try:
                 data, usage = call_chat_json(messages, args.model)
             except Exception as e:
-                print(f"Error during API call: {e}", file=sys.stderr)
+                print(f"Error during API call: {e}", file=sys.stderr, flush=True)
                 finished = True
                 break
             total_prompt_tokens += usage.get("prompt_tokens", 0)
             total_completion_tokens += usage.get("completion_tokens", 0)
 
             if not isinstance(data, dict) or not all(k in data for k in ("commands", "explanation", "finished")):
-                print("Model returned an unexpected JSON structure:", data, file=sys.stderr)
+                print("Model returned an unexpected JSON structure:", data, file=sys.stderr, flush=True)
                 finished = True
                 break
 
@@ -477,56 +477,44 @@ def main() -> None:
             finished_flag = data.get("finished", False)
 
             if not isinstance(commands, list) or not all(isinstance(c, str) for c in commands):
-                print("'commands' must be a list of strings. Received:", commands, file=sys.stderr)
+                print("'commands' must be a list of strings. Received:", commands, file=sys.stderr, flush=True)
                 finished = True
                 break
 
             if len(commands) > args.max_commands_per_step:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Limiting commands from {len(commands)} to {args.max_commands_per_step}")
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Limiting commands from {len(commands)} to {args.max_commands_per_step}", flush=True)
                 commands = commands[: args.max_commands_per_step]
 
-            print(f"\n=== Step {step_num} ===")
-            print(f"AI explanation: {explanation}")
+            print(f"\n=== Step {step_num} ===", flush=True)
+            print(f"AI explanation: {explanation}", flush=True)
             if commands:
-                print("Proposed commands:")
+                print("Proposed commands:", flush=True)
                 for cmd in commands:
-                    print(f"  $ {cmd}")
+                    print(f"  $ {cmd}", flush=True)
             else:
-                print("No commands proposed.")
+                print("No commands proposed.", flush=True)
 
             used_batch = False
 
             def execute_and_feedback(rc: int, stdout: str, stderr: str, cmd_desc: str):
                 if stdout:
-                    print("-- STDOUT --")
-                    print(stdout.rstrip())
+                    print("-- STDOUT --", flush=True)
+                    print(stdout.rstrip(), flush=True)
                 if stderr:
-                    print("-- STDERR --")
-                    print(stderr.rstrip(), file=sys.stderr)
+                    print("-- STDERR --", file=sys.stderr, flush=True)
+                    print(stderr.rstrip(), file=sys.stderr, flush=True)
                 messages.append({"role": "assistant", "content": json.dumps(data)})
                 summary = (f"{cmd_desc}\nReturn code: {rc}\nSTDOUT:\n{clip(stdout)}\nSTDERR:\n{clip(stderr)}")
                 messages.append({"role": "user", "content": summary})
 
             if len(commands) > 1 and any(h in "\n".join(commands) for h in ("set -e", ". /etc/", "source /etc", "export ", "&&", ";")):
-                if args.confirm:
-                    ans = input("Se propone ejecutar en un único bash -lc. ¿Continuar? [y/N]: ").strip().lower()
-                    if ans not in {"y","yes","s","si","sí"}:
-                        print("Saltando ejecución por confirmación del usuario.")
-                        messages.append({"role": "assistant", "content": json.dumps(data)})
-                        messages.append({"role": "user", "content": "User declined to run the batched script."})
-                        continue
                 script = "\n".join(commands)
                 if any(is_really_dangerous(line) for line in commands):
-                    print("Blocked batch due to dangerous line inside.")
+                    print("Blocked batch due to dangerous line inside.", flush=True)
                 else:
-                    if args.dry_run:
-                        print("[dry-run] (batch)")
-                        print(script)
-                        execute_and_feedback(0, "", "", "BATCH DRY-RUN")
-                    else:
-                        rc, out, err = run_shell_command(f"bash -lc {shlex.quote(script)}", timeout=args.timeout)
-                        used_batch = True
-                        execute_and_feedback(rc, out, err, "BATCH EXECUTION")
+                    rc, out, err = run_shell_command(f"bash -lc {shlex.quote(script)}", timeout=args.timeout)
+                    used_batch = True
+                    execute_and_feedback(rc, out, err, "BATCH EXECUTION")
 
             if not used_batch:
                 skip_remaining = False
@@ -543,7 +531,7 @@ def main() -> None:
                             f"{prev_err}\n"
                             "Please propose a different command or explain why the task cannot be completed."
                         )
-                        print(f"Skipping repeated failing command: {cmd}")
+                        print(f"Skipping repeated failing command: {cmd}", flush=True)
                         messages.append({"role": "assistant", "content": json.dumps(data)})
                         messages.append({"role": "user", "content": msg})
                         skip_remaining = True
@@ -551,24 +539,13 @@ def main() -> None:
 
                     if is_really_dangerous(cmd):
                         msg = f"Blocked dangerous command: {cmd}"
-                        print(msg)
+                        print(msg, flush=True)
                         messages.append({"role": "assistant", "content": json.dumps(data)})
                         messages.append({"role": "user", "content": msg})
                         skip_remaining = True
                         break
 
-                    if args.confirm:
-                        ans = input(f"¿Ejecutar el comando {idx}/{len(commands)}? [y/N]: ").strip().lower()
-                        if ans not in {"y","yes","s","si","sí"}:
-                            print("Saltando por confirmación del usuario.")
-                            continue
-
-                    if args.dry_run:
-                        print(f"[dry-run] {cmd}")
-                        execute_and_feedback(0, "", "", f"DRY-RUN: {cmd}")
-                        continue
-
-                    print(f"\nExecuting command {idx}/{len(commands)}: {cmd}")
+                    print(f"\nExecuting command {idx}/{len(commands)}: {cmd}", flush=True)
                     rc, stdout, stderr = run_shell_command(cmd, timeout=args.timeout)
                     execute_and_feedback(rc, stdout, stderr, f"Command: {cmd}")
 
@@ -584,15 +561,15 @@ def main() -> None:
                     continue
 
             if isinstance(finished_flag, bool) and finished_flag:
-                print("\nTask complete.\nSummary:")
-                print(explanation)
+                print("\nTask complete.\nSummary:", flush=True)
+                print(explanation, flush=True)
                 finished = True
                 break
 
             time.sleep(1)
 
         if not finished and step_num >= args.max_steps:
-            print("Maximum number of steps reached. The task may not be complete.")
+            print("Maximum number of steps reached. The task may not be complete.", flush=True)
 
     if total_prompt_tokens or total_completion_tokens:
         pricing = {
@@ -604,26 +581,26 @@ def main() -> None:
         if model_key in pricing:
             rates = pricing[model_key]
             cost = (total_prompt_tokens * rates["input"] + total_completion_tokens * rates["output"]) / 1000.0
-            print(f"\nApproximate API usage (chat): prompt_tokens={total_prompt_tokens}, completion_tokens={total_completion_tokens}.")
-            print(f"Estimated cost for model '{args.model}': ${cost:.4f} (USD)")
+            print(f"\nApproximate API usage (chat): prompt_tokens={total_prompt_tokens}, completion_tokens={total_completion_tokens}.", flush=True)
+            print(f"Estimated cost for model '{args.model}': ${cost:.4f} (USD)", flush=True)
         else:
-            print(f"\nToken usage (chat): prompt={total_prompt_tokens}, completion={total_completion_tokens}. Cost calc not implemented.")
+            print(f"\nToken usage (chat): prompt={total_prompt_tokens}, completion={total_completion_tokens}. Cost calc not implemented.", flush=True)
 PYCODE
 ${SUDO} chmod 644 "$DEST_DIR/ai_server_agent.py"
 
 # Report
 echo "[INFO] Writing report to $DEST_DIR/report.md"
 ${SUDO} tee "$DEST_DIR/report.md" >/dev/null <<'REPORTDOC'
-# Agente autónomo para administrar un servidor Debian con OpenAI (web auto + hardening)
+# Agente autónomo Debian con OpenAI (web auto + hardening + TTY robusto + API persistente)
+- **Web “auto”** por Responses API (`--web auto|on|off`), decisión una sola vez por tarea.
+- **Fallback** si web_search no está disponible.
+- **Batching** de pasos con estado; **guard** contra comandos peligrosos.
+- **Reintentos APT** inteligentes cuando cambian repos/llaves.
+- **Prompts robustos**: si stdin no es TTY, usa `/dev/tty`; si no hay TTY, sale informando.
+- **Salida sin buffering** para ver prompts/logs al instante.
+- **Claves persistentes** gestionadas por wrapper (`--set-key`, `--clear-key`, `--show-key`).
 
-- **Web “auto”** (Responses API): `--web auto|on|off` (por defecto `auto`), decisión una sola vez por tarea.
-- **Fallback** si la API o el modelo no soportan web_search.
-- **Batching seguro**, **detector de comandos peligrosos** tokenizado,
-- **Reintentos APT** contextuales,
-- **Límites por defecto altos** (24/24),
-- **Modelo y modo web** configurables vía entorno.
-
-Consulta el script para detalles.
+Revisa `/usr/local/bin/ai-agent -h` para opciones.
 REPORTDOC
 ${SUDO} chmod 644 "$DEST_DIR/report.md"
 
@@ -639,59 +616,186 @@ echo "[INFO] Installing Python dependencies into the virtual environment..."
 ${SUDO} "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
 ${SUDO} "$VENV_DIR/bin/pip" install --no-cache-dir 'openai>=1.60,<2' >/dev/null
 
-# Create a wrapper executable in /usr/local/bin (single-quoted heredoc to avoid expansion now)
+# Create a wrapper executable in /usr/local/bin with API persistence management.
 WRAPPER="/usr/local/bin/ai-agent"
 echo "[INFO] Creating wrapper executable $WRAPPER"
 ${SUDO} tee "$WRAPPER" >/dev/null <<'EOF'
 #!/bin/bash
-# Wrapper for launching the AI server agent
-
-# Fail fast on errors
+# Wrapper for launching the AI server agent (with API key persistence)
 set -euo pipefail
 
-# Ensure the OpenAI API key is provided via environment variable
-if [ -z "${OPENAI_API_KEY:-}" ]; then
-    echo "Error: OPENAI_API_KEY environment variable is not set." >&2
-    echo "Please export your OpenAI API key before running this command." >&2
-    exit 1
+AGENT_DIR="/opt/ai-agent"
+VENV_DIR="$AGENT_DIR/venv"
+PYTHON_BIN="$VENV_DIR/bin/python"
+AGENT_SCRIPT="$AGENT_DIR/ai_server_agent.py"
+KEY_FILE="/etc/ai-agent/agent.env"
+
+print_help() {
+  cat <<'HLP'
+ai-agent - Ejecuta el agente de automatización para Debian
+
+Uso:
+  ai-agent [opciones del agente] --task "instrucción"
+  ai-agent --set-key [API_KEY]     # Guarda la API en /etc/ai-agent/agent.env
+  ai-agent --clear-key             # Borra la API persistida
+  ai-agent --show-key              # Muestra la API (enmascarada)
+  ai-agent -h | --help             # Ayuda del wrapper (no requiere API)
+
+Notas:
+- Si OPENAI_API_KEY no está en el entorno, el wrapper intentará cargarla desde
+  /etc/ai-agent/agent.env y, si hay TTY, la pedirá e incluso permitirá guardarla.
+- Variables por defecto:
+  AI_AGENT_DEFAULT_MODEL (por defecto: gpt-5-mini)
+  AI_AGENT_DEFAULT_MAX_STEPS (24)
+  AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP (24)
+  AI_AGENT_WEB_MODE (auto|on|off; por defecto auto)
+- Para ver ayuda del agente Python:
+  ai-agent --help-agent
+HLP
+}
+
+mask_key() {
+  local key="$1"
+  local len=${#key}
+  if [ "$len" -le 8 ]; then
+    echo "********"
+  else
+    echo "${key:0:4}********${key: -4}"
+  fi
+}
+
+cmd_set_key() {
+  local new="$1"
+  if [ -z "$new" ]; then
+    if [ -t 0 ]; then
+      read -r -s -p "Introduce tu OPENAI_API_KEY: " new
+      echo
+    else
+      echo "[ERROR] No hay TTY y no se proporcionó clave. Usa: ai-agent --set-key TUCLAVE" >&2
+      exit 1
+    end
+  fi
+  install -m 700 -d /etc/ai-agent
+  umask 077
+  printf 'OPENAI_API_KEY=%s\n' "$new" > "$KEY_FILE"
+  echo "[OK] Clave guardada en $KEY_FILE"
+}
+
+cmd_clear_key() {
+  if [ -f "$KEY_FILE" ]; then
+    rm -f "$KEY_FILE"
+    echo "[OK] Clave eliminada de $KEY_FILE"
+  else
+    echo "[INFO] No hay clave persistida."
+  fi
+}
+
+cmd_show_key() {
+  if [ -f "$KEY_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$KEY_FILE"
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
+      echo "OPENAI_API_KEY=$(mask_key "$OPENAI_API_KEY")"
+    else
+      echo "[WARN] El archivo existe pero no tiene OPENAI_API_KEY."
+    fi
+  else
+    echo "[INFO] No hay clave persistida en $KEY_FILE"
+  fi
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  print_help
+  exit 0
 fi
 
-# Default model, limits and web mode (can be overridden by environment).
-# Defaults baked in here to avoid relying on installer variables.
+if [ "${1:-}" = "--help-agent" ]; then
+  exec "$PYTHON_BIN" "$AGENT_SCRIPT" --help
+fi
+
+case "${1:-}" in
+  --set-key)
+    shift
+    cmd_set_key "${1:-}"
+    exit 0
+    ;;
+  --clear-key)
+    cmd_clear_key
+    exit 0
+    ;;
+  --show-key)
+    cmd_show_key
+    exit 0
+    ;;
+esac
+
+# Try to load persistent key if env is empty
+if [ -z "${OPENAI_API_KEY:-}" ] && [ -r "$KEY_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$KEY_FILE"
+fi
+
+# If still missing and TTY, prompt
+if [ -z "${OPENAI_API_KEY:-}" ] && [ -t 0 ]; then
+  read -r -s -p "Introduce tu OPENAI_API_KEY: " OPENAI_API_KEY
+  echo
+  if [ -n "${OPENAI_API_KEY:-}" ]; then
+    read -r -p "¿Guardar esta clave en $KEY_FILE para usos futuros? [y/N]: " ans
+    case "${ans,,}" in
+      y|yes|s|si|sí)
+        install -m 700 -d /etc/ai-agent
+        umask 077
+        printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" > "$KEY_FILE"
+        echo "[OK] Clave guardada."
+        ;;
+      *) ;;
+    esac
+  fi
+fi
+
+if [ -z "${OPENAI_API_KEY:-}" ]; then
+  echo "[ERROR] OPENAI_API_KEY no está definida. Usa 'ai-agent --set-key' o expórtala." >&2
+  exit 1
+fi
+
+# Defaults (can be overridden by environment)
 : "${AI_AGENT_DEFAULT_MODEL:=gpt-5-mini}"
 : "${AI_AGENT_DEFAULT_MAX_STEPS:=24}"
 : "${AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP:=24}"
 : "${AI_AGENT_WEB_MODE:=auto}"
 
-# Fixed paths for the agent installation
-AGENT_DIR="/opt/ai-agent"
-VENV_DIR="$AGENT_DIR/venv"
-PYTHON_BIN="$VENV_DIR/bin/python"
-AGENT_SCRIPT="$AGENT_DIR/ai_server_agent.py"
+# Ensure unbuffered output from Python
+export PYTHONUNBUFFERED=1
 
 exec env AI_AGENT_DEFAULT_MODEL="$AI_AGENT_DEFAULT_MODEL" \
         AI_AGENT_DEFAULT_MAX_STEPS="$AI_AGENT_DEFAULT_MAX_STEPS" \
         AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP="$AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP" \
         AI_AGENT_WEB_MODE="$AI_AGENT_WEB_MODE" \
+        OPENAI_API_KEY="$OPENAI_API_KEY" \
     "$PYTHON_BIN" "$AGENT_SCRIPT" "$@"
 EOF
 ${SUDO} chmod +x "$WRAPPER"
 
 echo "[SUCCESS] Installation complete."
 echo ""
-# Prompt the user for an API key and optionally run the agent immediately.
-read -r -s -p "Introduce tu clave OpenAI API para ejecutar el agente ahora (se ocultará, deja en blanco para omitir): " API_KEY_INPUT
-echo
-if [ -n "$API_KEY_INPUT" ]; then
-    export OPENAI_API_KEY="$API_KEY_INPUT"
-    echo "[INFO] Ejecutando el agente interactivo..."
-    AI_AGENT_DEFAULT_MODEL="$DEFAULT_MODEL" \
-    AI_AGENT_DEFAULT_MAX_STEPS="$DEFAULT_MAX_STEPS" \
-    AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP="$DEFAULT_MAX_CMDS_PER_STEP" \
-    AI_AGENT_WEB_MODE="$DEFAULT_WEB_MODE" \
-      "$VENV_DIR/bin/python" "$DEST_DIR/ai_server_agent.py" "$@"
-else
-    printf "No se ha introducido ninguna clave; la instalación ha finalizado sin ejecutar el agente.\n"
-    printf "Para utilizar el agente más adelante:\n  export OPENAI_API_KEY=<tu-clave>\n  ai-agent --task \"tu instrucción\"\n"
+# Prompt the user ONCE: offer to store the key now (optional)
+if [ -t 0 ]; then
+  read -r -p "¿Quieres guardar ahora tu OPENAI_API_KEY para futuros usos? [y/N]: " WANT_SAVE
+  case "${WANT_SAVE,,}" in
+    y|yes|s|si|sí)
+      read -r -s -p "Introduce tu OPENAI_API_KEY: " K
+      echo
+      if [ -n "${K:-}" ]; then
+        ${SUDO} install -m 700 -d /etc/ai-agent
+        umask 077
+        echo "OPENAI_API_KEY=$K" | ${SUDO} tee /etc/ai-agent/agent.env >/dev/null
+        echo "[OK] Clave guardada en /etc/ai-agent/agent.env"
+      else
+        echo "[INFO] No se ha introducido ninguna clave; puedes usar 'ai-agent --set-key' más tarde."
+      fi
+      ;;
+    *) echo "[INFO] Puedes usar 'ai-agent --set-key' para guardarla más adelante." ;;
+  esac
 fi
-printf "\nPuedes volver a ejecutar este script para actualizar el agente, reescribir el informe o introducir una nueva clave de API.\n"
+
+printf "\nListo. Prueba ahora:\n  ai-agent --help-agent\n  ai-agent --task \"muestra 'uname -a' y 'lsb_release -a'\" \n"
