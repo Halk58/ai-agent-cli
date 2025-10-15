@@ -1,22 +1,13 @@
 #!/bin/bash
 # install_ai_agent.sh - Deploy the AI server agent on a Debian 12/13 system
 #
-# This script installs Python dependencies, copies the agent code to
-# /opt/ai-agent, sets up a virtual environment, and creates a wrapper
-# executable in /usr/local/bin called `ai-agent` so that you can run the
-# agent from anywhere.  It must be run with sufficient privileges to
-# install software and create directories under /opt and /usr/local/bin.
-#
-# Usage:
-#   sudo bash install_ai_agent.sh
-#
-# After running this script you can invoke the agent with:
-#   ai-agent --task "update the system"
+# One-file installer: copies the Python agent to /opt/ai-agent, creates a venv,
+# and installs a wrapper /usr/local/bin/ai-agent. Safe to re-run for updates.
 #
 set -euo pipefail
 
-# ========= User-tunable defaults =========
-DEFAULT_MODEL="gpt-5-mini"          # Override per run: AI_AGENT_DEFAULT_MODEL="gpt-4o" ai-agent ...
+# ========= User-tunable defaults (used by wrapper as fallbacks) =========
+DEFAULT_MODEL="gpt-5-mini"          # override per-run: AI_AGENT_DEFAULT_MODEL="gpt-4o" ai-agent ...
 DEFAULT_MAX_STEPS=24
 DEFAULT_MAX_CMDS_PER_STEP=24
 DEFAULT_WEB_MODE="auto"             # auto|on|off
@@ -37,16 +28,11 @@ if command -v flock >/dev/null 2>&1; then
   fi
 fi
 
-# Versioning and update mechanism
-SCRIPT_VERSION="1.3.6"
+# ===== Versioning and self-update =====
+SCRIPT_VERSION="1.4.0"
 UPDATE_URL="https://raw.githubusercontent.com/Halk58/ai-agent-cli/main/install_ai_agent.sh"
 
-# Determine whether sudo is available. Some minimal containers do not have sudo installed.
-if command -v sudo >/dev/null 2>&1; then
-    SUDO="sudo"
-else
-    SUDO=""
-fi
+if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
 
 # Distro check (warn only)
 if [ -r /etc/os-release ]; then
@@ -56,32 +42,27 @@ if [ -r /etc/os-release ]; then
   fi
 fi
 
-# Auto-update: fetch the script at UPDATE_URL and compare versions
-if [ -n "$UPDATE_URL" ]; then
-    if command -v curl >/dev/null 2>&1; then
-        tmp_update_file="$(mktemp)"
-        cleanup_update_tmp() { rm -f "$tmp_update_file"; }
-        trap cleanup_update_tmp EXIT
-        if curl -fsSL --connect-timeout 5 -m 15 -H 'Cache-Control: no-cache' "$UPDATE_URL" -o "$tmp_update_file"; then
-            remote_version="$(grep -Eo 'SCRIPT_VERSION=\"?[0-9]+\.[0-9]+\.[0-9]+\"?' "$tmp_update_file" | head -n1 | grep -Eo '([0-9]+\.){2}[0-9]+')"
-            if [ -n "$remote_version" ]; then
-                newest_version="$(printf '%s\n%s' "$SCRIPT_VERSION" "$remote_version" | sort -V | tail -n1)"
-                if [ "$newest_version" = "$remote_version" ] && [ "$SCRIPT_VERSION" != "$remote_version" ]; then
-                    echo "[INFO] A newer version ($remote_version) is available. Updating self from $UPDATE_URL ..."
-                    script_path="$(readlink -f -- "$0")"
-                    ${SUDO} install -m 755 "$tmp_update_file" "$script_path"
-                    echo "[INFO] Re-executing the updated installer..."
-                    exec "$script_path" "$@"
-                fi
-            else
-                echo "[WARN] No pude extraer SCRIPT_VERSION del archivo remoto."
-            fi
-        else
-            echo "[WARN] No se pudo descargar $UPDATE_URL. Continuo con la versión local."
-        fi
+# Auto-update: fetch UPDATE_URL and compare SCRIPT_VERSION
+if [ -n "$UPDATE_URL" ] && command -v curl >/dev/null 2>&1; then
+  tmp_update_file="$(mktemp)"
+  trap 'rm -f "$tmp_update_file"' EXIT
+  if curl -fsSL --connect-timeout 5 -m 15 -H 'Cache-Control: no-cache' "$UPDATE_URL" -o "$tmp_update_file"; then
+    remote_version="$(grep -Eo 'SCRIPT_VERSION=\"?[0-9]+\.[0-9]+\.[0-9]+\"?' "$tmp_update_file" | head -n1 | grep -Eo '([0-9]+\.){2}[0-9]+')"
+    if [ -n "$remote_version" ]; then
+      newest="$(printf '%s\n%s' "$SCRIPT_VERSION" "$remote_version" | sort -V | tail -n1)"
+      if [ "$newest" = "$remote_version" ] && [ "$SCRIPT_VERSION" != "$remote_version" ]; then
+        echo "[INFO] A newer version ($remote_version) is available. Updating self from $UPDATE_URL ..."
+        script_path="$(readlink -f -- "$0")"
+        ${SUDO} install -m 755 "$tmp_update_file" "$script_path"
+        echo "[INFO] Re-executing the updated installer..."
+        exec "$script_path" "$@"
+      fi
     else
-        echo "[WARN] UPDATE_URL definido pero 'curl' no está disponible; omito auto-actualización."
+      echo "[WARN] No pude extraer SCRIPT_VERSION del archivo remoto."
     fi
+  else
+    echo "[WARN] No se pudo descargar $UPDATE_URL. Continuo con la versión local."
+  fi
 fi
 
 echo "[INFO] Updating package lists..."
@@ -100,13 +81,16 @@ echo "[INFO] Writing agent script to $DEST_DIR/ai_server_agent.py"
 ${SUDO} tee "$DEST_DIR/ai_server_agent.py" >/dev/null <<'PYCODE'
 #!/usr/bin/env python3
 """
-ai_server_agent.py - Automate server tasks on Debian using OpenAI's API
+ai_server_agent.py - Autonomous admin agent for Debian using OpenAI.
 
-Behavior goals:
-- Single prompt: "Enter task..." — the agent decides transparently whether to fetch web context ONCE (auto mode) and proceeds.
-- Keep things fast: one Responses call for web decision+fetch; concise outputs; minimal commands.
-- Avoid gratuitous network curls; prefer local commands. If web info is needed, use WEB_CONTEXT.
-- Hardened: tokenized dangerous command detection, batching, context-aware APT retries, TTY-robust input.
+Goals:
+- Single prompt per task (no pre-prompt visible). Web-search decision is transparent and done once per task.
+- Faster: concise outputs, strict command cap, robust token-cap compatibility.
+- Resilient: auto-batching with bash -lc when state is needed; tokenized dangerous-command guard.
+- Self-healing guidance: detects common failure patterns and injects DIAGNOSTIC_HINTS (no blind mutations).
+- ENV snapshot + network check shared with the model to reduce wrong steps.
+- Sliding window context (summarize old turns) to keep latency/cost low.
+
 """
 
 import argparse
@@ -122,10 +106,10 @@ from typing import Any, Dict, List, Tuple
 try:
     from openai import OpenAI
 except ImportError:
-    print("La librería 'openai' no está instalada. Instálala con: pip install 'openai>=1.60,<2'", file=sys.stderr)
+    print("Falta la librería 'openai'. Instala con: pip install 'openai>=1.60,<2'", file=sys.stderr)
     sys.exit(1)
 
-# ===== Defaults configurable via environment =====
+# ===== Defaults via environment =====
 DEFAULT_MODEL = os.getenv("AI_AGENT_DEFAULT_MODEL", "gpt-5-mini")
 DEFAULT_MAX_STEPS = int(os.getenv("AI_AGENT_DEFAULT_MAX_STEPS", "24"))
 DEFAULT_MAX_CMDS_PER_STEP = int(os.getenv("AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP", "24"))
@@ -133,19 +117,15 @@ DEFAULT_WEB_MODE = os.getenv("AI_AGENT_WEB_MODE", "auto")  # auto|on|off
 
 # ===== Utilities =====
 def run_shell_command(command: str, timeout: int = 900) -> Tuple[int, str, str]:
-    """Run a shell command with a timeout and sane environment; return (rc, stdout, stderr)."""
+    """Run a shell command with sane env + timeout; return rc, stdout, stderr."""
     env = os.environ.copy()
     env.setdefault("DEBIAN_FRONTEND", "noninteractive")
     env.setdefault("LC_ALL", "C.UTF-8")
     env.setdefault("LANG", "C.UTF-8")
     try:
         proc = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
+            command, shell=True, capture_output=True, text=True,
+            timeout=timeout, env=env
         )
         return proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as e:
@@ -165,7 +145,8 @@ def is_really_dangerous(cmd: str) -> bool:
     parts = _tokenize(cmd)
     if not parts:
         return False
-    if parts[0] == "rm":
+    head = parts[0]
+    if head == "rm":
         flags = {p for p in parts[1:] if p.startswith("-")}
         targets = [p for p in parts[1:] if not p.startswith("-")]
         has_rf = any(("r" in f and "f" in f) for f in flags)
@@ -177,67 +158,82 @@ def is_really_dangerous(cmd: str) -> bool:
                     continue
     if any(p.startswith("mkfs") for p in parts):
         return True
-    if parts[0] == "dd" and any(x.startswith("of=/dev/") for x in parts[1:]):
+    if head == "dd" and any(x.startswith("of=/dev/") for x in parts[1:]):
         return True
-    if parts[0] in {"shutdown", "reboot", "halt"}:
+    if head in {"shutdown", "reboot", "halt", "poweroff"}:
         return True
     if ":(){ :|:& };:" in cmd:
         return True
+    # Ultra-dangerous wildcards
+    if cmd.strip().startswith("chmod -R") and " /" in cmd:
+        return True
     return False
 
-def clip(text: str, limit: int = 3000) -> str:
+def clip(text: str, limit: int = 2500) -> str:
     if text is None:
         return ""
     if len(text) <= limit:
         return text
-    head, tail = text[:1400], text[-800:]
-    return f"{head}\n...<clipped {len(text)-2200} chars>...\n{tail}"
+    head, tail = text[:1200], text[-700:]
+    return f"{head}\n...<clipped {len(text)-1900} chars>...\n{tail}"
 
 def build_system_prompt() -> str:
     return (
         "You are a server automation agent on Debian Linux.\n"
         "- Respond ONLY with strict JSON: {\"commands\": [\"...\"], \"explanation\":\"...\", \"finished\": true|false}.\n"
-        "- Keep 'explanation' concise (<= 280 chars). Propose the FEWEST commands needed (<= 5).\n"
-        "- Avoid HTTP fetching with curl/wget for general info; rely on provided WEB_CONTEXT when present.\n"
-        "- Each command runs in a fresh shell. If you need state, propose ONE multi-line script via `bash -lc`.\n"
-        "- Prefer non-interactive flags; avoid destructive ops and interactive prompts.\n"
+        "- Keep explanation <= 280 chars. Propose the FEWEST commands (<= 5) to achieve the step.\n"
+        "- Avoid HTTP fetches (curl/wget) unless WEB_CONTEXT explicitly supports it. Prefer native OS tools.\n"
+        "- Each command runs in a fresh shell. If state is needed (variables, set -e), propose ONE multi-line bash -lc script.\n"
+        "- Prefer non-interactive flags; avoid destructive ops and interactive prompts."
     )
 
+# ----- Chat Completions with token-cap compatibility + retries -----
+def chat_request_with_backoff(client, params_builder, max_attempts=4, first_wait=0.6):
+    wait = first_wait
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return params_builder()
+        except Exception as exc:
+            last_exc = exc
+            s = str(exc).lower()
+            # retry on rate limits / transient errors
+            if any(code in s for code in (" 429", " 500", " 502", " 503", "timeout")):
+                time.sleep(wait)
+                wait = min(wait * 2, 5.0)
+                continue
+            break
+    raise last_exc
+
 def call_chat_json(messages: List[Dict[str, str]], model: str) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Chat Completions en JSON, con compatibilidad de límite de tokens:
-       intenta max_completion_tokens → max_tokens → sin límite."""
+    """Chat Completions JSON; cap via max_completion_tokens → max_tokens → none."""
     client = OpenAI()
 
-    def _call_with_cap(msgs, with_temp: bool, cap_key: str | None):
+    def _call(msgs, with_temp: bool, cap_key: str | None):
         params = dict(model=model, messages=msgs, response_format={"type": "json_object"})
         if with_temp:
+            # Algunos modelos no aceptan temperature; se reintenta sin él más abajo
             params["temperature"] = 0.0
         if cap_key:
-            params[cap_key] = 700  # cap conservador para respuestas concisas
-        return client.chat.completions.create(**params)
+            params[cap_key] = 600  # salida concisa
+        def builder():
+            return client.chat.completions.create(**params)
+        return chat_request_with_backoff(client, builder)
 
-    # 1) Intento con max_completion_tokens (modelos nuevos)
     try:
-        resp = _call_with_cap(messages, with_temp=True, cap_key="max_completion_tokens")
+        resp = _call(messages, with_temp=True, cap_key="max_completion_tokens")
     except Exception as e1:
-        msg1 = str(e1).lower()
-        # 2) Intento con max_tokens (modelos antiguos)
         try:
-            # si el error fue “unsupported parameter” para max_completion_tokens, probamos max_tokens
-            resp = _call_with_cap(messages, with_temp=True, cap_key="max_tokens")
+            resp = _call(messages, with_temp=True, cap_key="max_tokens")
         except Exception as e2:
-            msg2 = str(e2).lower()
-            # 3) Último recurso: sin límite explícito
             try:
-                resp = _call_with_cap(messages, with_temp=True, cap_key=None)
+                resp = _call(messages, with_temp=True, cap_key=None)
             except Exception as e3:
-                # Reintento sin temperatura por si el modelo no permite temperature
+                # último recurso: sin temperature
                 try:
-                    resp = _call_with_cap(messages, with_temp=False, cap_key=None)
+                    resp = _call(messages, with_temp=False, cap_key=None)
                 except Exception:
-                    raise RuntimeError(
-                        f"OpenAI API call failed: {e1}\nThen: {e2}\nFinally: {e3}"
-                    ) from e3
+                    raise RuntimeError(f"OpenAI API call failed: {e1}\nThen: {e2}\nFinally: {e3}") from e3
 
     content = resp.choices[0].message.content
     try:
@@ -252,7 +248,7 @@ def call_chat_json(messages: List[Dict[str, str]], model: str) -> Tuple[Dict[str
     }
     return data, usage_dict
 
-# ===== Responses API Web Search (ONE call, one-off per task) =====
+# ----- Responses API one-shot web-search -----
 def responses_available() -> bool:
     try:
         _ = OpenAI().responses
@@ -261,12 +257,7 @@ def responses_available() -> bool:
         return False
 
 def responses_web_autoplan(task: str, model: str, mode: str) -> str:
-    """
-    Single Responses call. The model must:
-      - If web search helps, USE the web_search tool and return 'WEB_CONTEXT:\\n<summary>'
-      - Otherwise return 'NO_WEB: <short reason>'
-    Returns just the extracted summary (or empty string).
-    """
+    """One call: decide+fetch web context. Returns summary or empty."""
     if mode == "off" or not responses_available():
         return ""
     prompt = (
@@ -284,42 +275,96 @@ def responses_web_autoplan(task: str, model: str, mode: str) -> str:
         return ""
     text = getattr(resp, "output_text", "") or str(resp)
     if not isinstance(text, str):
-        try:
-            text = str(text)
-        except Exception:
-            return ""
+        try: text = str(text)
+        except Exception: return ""
     if "WEB_CONTEXT:" in text:
         return text.split("WEB_CONTEXT:", 1)[1].strip()
-    return ""  # NO_WEB or malformed -> no web context
+    return ""  # NO_WEB or any other response → no web
 
-def tty_input(prompt: str) -> str:
-    """Read a line; if no TTY, try /dev/tty; if still no TTY, return empty."""
+# ----- ENV snapshot to help the model -----
+def read_os_release() -> Dict[str, str]:
+    out = {}
     try:
-        if sys.stdin and sys.stdin.isatty():
-            return input(prompt)
-        with open("/dev/tty", "r", encoding="utf-8", errors="ignore") as tty:
-            print(prompt, end="", flush=True)
-            return tty.readline().rstrip("\n")
+        with open("/etc/os-release", "r", encoding="utf-8") as f:
+            for line in f:
+                line=line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k,v=line.split("=",1)
+                    out[k]=v.strip().strip('"')
     except Exception:
+        pass
+    return out
+
+def net_status() -> str:
+    # very light check
+    rc,_,_ = run_shell_command("getent hosts deb.debian.org >/dev/null 2>&1 || getent hosts 1.1.1.1 >/dev/null 2>&1", timeout=5)
+    if rc!=0: return "degraded/no-dns"
+    rc,_,_ = run_shell_command("ping -n -c1 -W1 1.1.1.1 >/dev/null 2>&1", timeout=3)
+    return "online" if rc==0 else "dns-only"
+
+def env_snapshot() -> str:
+    osr = read_os_release()
+    root = os.geteuid()==0
+    rc_df,out_df,_ = run_shell_command("df -h / | awk 'NR==2{print $4\" free\"}'", timeout=3)
+    disk = out_df.strip() if rc_df==0 else "n/a"
+    rc_mem,out_mem,_ = run_shell_command("awk '/MemAvailable/{printf \"%.0f MB\", $2/1024}' /proc/meminfo", timeout=3)
+    mem = out_mem.strip() if rc_mem==0 else "n/a"
+    net = net_status()
+    return (
+        f"OS={osr.get('PRETTY_NAME','unknown')} CODENAME={osr.get('VERSION_CODENAME','?')} "
+        f"ROOT={'yes' if root else 'no'} NET={net} DISK_FREE={disk} MEM_FREE={mem}"
+    )
+
+# ----- Diagnostic hints injected when failures are seen -----
+def diag_hints_for(cmd: str, rc: int, stderr: str, stdout: str) -> str:
+    s = (stderr or "") + "\n" + (stdout or "")
+    s_low = s.lower()
+    hints = []
+
+    if "dpkg was interrupted" in s or "run 'dpkg --configure -a'" in s_low:
+        hints.append("Run: dpkg --configure -a (non-interactive).")
+    if "could not get lock" in s_low and ("dpkg" in s_low or "apt" in s_low):
+        hints.append("Another APT/dpkg is running. Wait/kill process; then retry apt-get update.")
+    if "hash sum mismatch" in s_low:
+        hints.append("Try: apt-get clean && apt-get update.")
+    if "temporary failure resolving" in s_low or "name resolution" in s_low:
+        hints.append("DNS/network issue. Check resolv.conf or wait for connectivity.")
+    if "InRelease" in s and "is not signed" in s_low:
+        hints.append("Repository not signed; ensure correct keyring and signed-by= in sources.list.d/*.list.")
+    if "missing key" in s_low or ("no pubkey" in s_low):
+        hints.append("Missing repo key; import key to /etc/apt/trusted.gpg.d or /etc/apt/keyrings and use signed-by= option.")
+    if "permission denied" in s_low:
+        hints.append("Permission denied; if not root, use sudo or adjust file perms/ownership.")
+    if "command not found" in s_low:
+        hints.append("Command not found; install the package providing it (apt-get install <pkg>).")
+    if "no space left on device" in s_low:
+        hints.append("Disk full; free space on / or target fs.")
+    if rc==124:
+        hints.append("Command timeout; consider splitting, reducing verbosity, or increasing timeout.")
+
+    if not hints:
         return ""
+    return "DIAGNOSTIC_HINTS:\n- " + "\n- ".join(hints)
 
-def apt_context_signature() -> str:
-    """Signature of APT context; changes when sources/keys change (used for smart retries)."""
-    paths = ["/etc/apt/sources.list"]
-    paths.extend(sorted(glob("/etc/apt/sources.list.d/*.list")))
-    paths.extend(sorted(glob("/etc/apt/trusted.gpg.d/*.gpg")))
-    sig_parts = []
-    for p in paths:
-        try:
-            st = os.stat(p)
-            sig_parts.append(f"{p}:{int(st.st_mtime)}:{st.st_size}")
-        except FileNotFoundError:
-            sig_parts.append(f"{p}:absent")
-        except Exception:
-            pass
-    return "|".join(sig_parts)
-
-RETRY_WHITELIST = {"apt-get update", "apt update", "apt-get -f install", "apt -f install", "dpkg --configure -a"}
+# ----- Sliding window summarization (lightweight heuristic) -----
+def maybe_summarize_history(messages: List[Dict[str,str]], max_keep: int = 18) -> None:
+    """If the chat gets long, summarize old user/assistant turns into one system note."""
+    if len(messages) <= max_keep:
+        return
+    # Keep: system prompt, latest 12 turns, and collapse the middle
+    head = [messages[0]]
+    tail = messages[-12:]
+    middle = messages[1:-12]
+    # Basic compress: keep last assistant tool outputs; drop big stdout/stderr blocks
+    summaries = []
+    for m in middle:
+        role = m.get("role","")
+        content = m.get("content","")
+        if role in ("user","assistant"):
+            # strip massive outputs
+            summaries.append(f"{role}: {clip(content, 400)}")
+    collapsed = {"role":"system","content":"SUMMARY_OF_PRIOR_CONTEXT:\n" + "\n".join(summaries[:40])}
+    messages[:] = head + [collapsed] + tail
 
 # ===== Main =====
 def main() -> None:
@@ -337,34 +382,30 @@ def main() -> None:
 
     os.environ["PYTHONUNBUFFERED"] = "1"
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    if not os.getenv("OPENAI_API_KEY"):
         print("Error: OPENAI_API_KEY no está definida. Exporta tu clave o usa 'ai-agent --set-key'.", file=sys.stderr, flush=True)
         sys.exit(1)
 
     print("[INFO] Agent starting (interactive).", flush=True)
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": build_system_prompt()}]
+    # Provide environment snapshot to the model to reduce missteps
+    messages.append({"role":"system","content": "ENV_SNAPSHOT: " + env_snapshot()})
 
-    # First task (single prompt)
+    # Single prompt for the first task
     if args.task:
         first_task = args.task.strip()
     else:
-        first_task = tty_input("Enter task (or press Enter to exit): ").strip()
+        first_task = input("Enter task (or press Enter to exit): ").strip() if sys.stdin.isatty() else ""
         if not first_task:
             print("Exiting interactive session.", flush=True)
             return
 
-    # Decide and fetch optional WEB_CONTEXT (transparent for the user)
-    if args.web == "on":
-        web_ctx = responses_web_autoplan(first_task, args.model, "on")
+    # One-shot web context
+    if args.web in ("on","auto"):
+        web_ctx = responses_web_autoplan(first_task, args.model, args.web)
         if web_ctx:
             messages.append({"role": "system", "content": "WEB_CONTEXT:\n" + clip(web_ctx, 2000)})
-    elif args.web == "auto":
-        web_ctx = responses_web_autoplan(first_task, args.model, "auto")
-        if web_ctx:
-            messages.append({"role": "system", "content": "WEB_CONTEXT:\n" + clip(web_ctx, 2000)})
-    # args.web == "off" => skip
 
     total_prompt_tokens = 0
     total_completion_tokens = 0
@@ -373,39 +414,42 @@ def main() -> None:
     failed_commands_count: Dict[str, int] = {}
     command_errors: Dict[str, str] = {}
 
-    # Process first task immediately (no extra prompt)
     pending_task = first_task
 
     while True:
-        if pending_task is not None:
-            user_task = pending_task
-            pending_task = None
-        else:
-            user_task = tty_input("Enter next task (or press Enter to exit): ").strip()
-            if not user_task:
-                print("Exiting interactive session.", flush=True)
-                break
+        user_task = pending_task if pending_task is not None else input("Enter next task (or press Enter to exit): ").strip()
+        pending_task = None
+        if not user_task:
+            print("Exiting interactive session.", flush=True)
+            break
 
         messages.append({"role": "user", "content": user_task})
         finished = False
 
         for step_num in range(1, args.max_steps + 1):
             apt_sig_before = apt_context_signature()
+
+            # Trim history if needed
+            maybe_summarize_history(messages)
+
             try:
                 data, usage = call_chat_json(messages, args.model)
             except Exception as e:
                 print(f"Error during API call: {e}", file=sys.stderr, flush=True)
                 finished = True
                 break
+
             total_prompt_tokens += usage.get("prompt_tokens", 0)
             total_completion_tokens += usage.get("completion_tokens", 0)
 
+            # Validate JSON
             if not isinstance(data, dict) or not all(k in data for k in ("commands", "explanation", "finished")):
                 print("Model returned an unexpected JSON structure:", data, file=sys.stderr, flush=True)
                 finished = True
                 break
+
             commands = data.get("commands", []) or []
-            explanation = data.get("explanation", "")[:500]
+            explanation = (data.get("explanation", "") or "")[:500]
             finished_flag = bool(data.get("finished", False))
 
             if not isinstance(commands, list) or not all(isinstance(c, str) for c in commands):
@@ -421,42 +465,51 @@ def main() -> None:
             print(f"AI explanation: {explanation}", flush=True)
             if commands:
                 print("Proposed commands:", flush=True)
-                for cmd in commands:
-                    print(f"  $ {cmd}", flush=True)
+                for c in commands:
+                    print(f"  $ {c}", flush=True)
             else:
                 print("No commands proposed.", flush=True)
 
-            # Batch if shared state is likely
-            batcheable = False
+            # Decide if we should auto-batch into one script (more aggressive)
+            combine = False
             if len(commands) > 1:
-                text = "\n".join(commands)
-                hints = ["set -e", "set -o pipefail", ". /etc/os-release", "source /etc/os-release", "export ", "&&", ";"]
-                batcheable = any(h in text for h in hints)
+                joined = "\n".join(commands)
+                # heuristics: signs of shared state OR chaining
+                kws = [" set -e", "set -o pipefail", "export ", "=", "&&", ";", ". /etc/os-release", "source /etc/os-release", "cd "]
+                combine = any(k in joined for k in kws)
 
-            if batcheable:
+            if combine:
+                # Safety check
                 if any(is_really_dangerous(c) for c in commands):
                     print("Blocked batch due to dangerous line.", flush=True)
                 else:
                     script = "\n".join(commands)
                     if args.confirm:
-                        ans = tty_input("Execute batch script? [y/N]: ").strip().lower()
+                        ans = (input("Execute batch script? [y/N]: ").strip().lower() if sys.stdin.isatty() else "n")
                         if ans not in {"y", "yes", "s", "si", "sí"}:
                             print("Batch skipped by user.", flush=True)
-                            # ask for alternative
                             messages.append({"role": "assistant", "content": json.dumps(data)})
-                            messages.append({"role": "user", "content": "User declined batch execution. Propose minimal single command instead."})
+                            messages.append({"role": "user", "content": "User declined batch execution. Propose one minimal safe command instead."})
                             continue
                     if args.dry_run:
                         print("[DRY-RUN] bash -lc <<SCRIPT\n" + script + "\nSCRIPT", flush=True)
                         rc, out, err = 0, "", ""
                     else:
                         rc, out, err = run_shell_command(f"bash -lc {shlex.quote(script)}", timeout=args.timeout)
-                    if out:
-                        print("-- STDOUT --", flush=True); print(out.rstrip(), flush=True)
-                    if err:
-                        print("-- STDERR --", file=sys.stderr, flush=True); print(err.rstrip(), file=sys.stderr, flush=True)
+
+                    if out: print("-- STDOUT --", flush=True); print(out.rstrip(), flush=True)
+                    if err: print("-- STDERR --", file=sys.stderr, flush=True); print(err.rstrip(), file=sys.stderr, flush=True)
+
                     messages.append({"role": "assistant", "content": json.dumps(data)})
+
+                    # If failed, inject diagnostic hints to guide next step
+                    if rc != 0:
+                        hints = diag_hints_for("BATCH", rc, err, out)
+                        if hints:
+                            messages.append({"role":"system","content": hints})
+
                     messages.append({"role": "user", "content": f"BATCH EXECUTION\nReturn code: {rc}\nSTDOUT:\n{clip(out)}\nSTDERR:\n{clip(err)}"})
+
                     if finished_flag:
                         print("\nTask complete.\nSummary:", flush=True)
                         print(explanation, flush=True)
@@ -466,20 +519,18 @@ def main() -> None:
 
             skip_remaining = False
             for idx, cmd in enumerate(commands, start=1):
-                allow_retry = any(cmd.strip().startswith(k) for k in RETRY_WHITELIST)
                 previously_failed = cmd in failed_commands_count
+
+                # allow limited retry patterns if APT context changed
+                allow_retry = any(cmd.strip().startswith(k) for k in ("apt-get update","apt update","apt-get -f install","apt -f install","dpkg --configure -a"))
                 apt_sig_now = apt_context_signature()
                 apt_changed = (apt_sig_now != last_apt_sig) or (apt_sig_now != apt_sig_before)
 
                 if previously_failed and not (allow_retry and apt_changed and failed_commands_count[cmd] < 3):
                     prev_err = command_errors.get(cmd, "")
-                    msg = (
-                        f"The command '{cmd}' was already attempted and failed with:\n{prev_err}\n"
-                        "Please propose a different command or explain why the task cannot be completed."
-                    )
                     print(f"Skipping repeated failing command: {cmd}", flush=True)
                     messages.append({"role": "assistant", "content": json.dumps(data)})
-                    messages.append({"role": "user", "content": msg})
+                    messages.append({"role": "user", "content": f"The command '{cmd}' already failed with:\n{prev_err}\nPropose an alternative or explain next steps."})
                     skip_remaining = True
                     break
 
@@ -487,16 +538,16 @@ def main() -> None:
                     msg = f"Blocked dangerous command: {cmd}"
                     print(msg, flush=True)
                     messages.append({"role": "assistant", "content": json.dumps(data)})
-                    messages.append({"role": "user", "content": msg})
+                    messages.append({"role": "system", "content": "DIAGNOSTIC_HINTS:\n- Proposed command blocked as dangerous. Provide a safer alternative."})
                     skip_remaining = True
                     break
 
                 if args.confirm:
-                    ans = tty_input(f"Execute command {idx}/{len(commands)}? [y/N]: ").strip().lower()
+                    ans = (input(f"Execute command {idx}/{len(commands)}? [y/N]: ").strip().lower() if sys.stdin.isatty() else "n")
                     if ans not in {"y","yes","s","si","sí"}:
                         print("Skipped by user.", flush=True)
                         messages.append({"role":"assistant","content":json.dumps(data)})
-                        messages.append({"role":"user","content":f"User declined: {cmd}. Propose a different minimal command."})
+                        messages.append({"role":"user","content":f"User declined: {cmd}. Propose a different minimal safe command."})
                         continue
 
                 print(f"\nExecuting command {idx}/{len(commands)}: {cmd}", flush=True)
@@ -504,16 +555,21 @@ def main() -> None:
                     rc, stdout, stderr = 0, "", ""
                 else:
                     rc, stdout, stderr = run_shell_command(cmd, timeout=args.timeout)
-                if stdout:
-                    print("-- STDOUT --", flush=True); print(stdout.rstrip(), flush=True)
-                if stderr:
-                    print("-- STDERR --", file=sys.stderr, flush=True); print(stderr.rstrip(), file=sys.stderr, flush=True)
+
+                if stdout: print("-- STDOUT --", flush=True); print(stdout.rstrip(), flush=True)
+                if stderr: print("-- STDERR --", file=sys.stderr, flush=True); print(stderr.rstrip(), file=sys.stderr, flush=True)
+
                 messages.append({"role": "assistant", "content": json.dumps(data)})
-                output_summary = f"Command: {cmd}\nReturn code: {rc}\nSTDOUT:\n{clip(stdout)}\nSTDERR:\n{clip(stderr)}"
-                messages.append({"role": "user", "content": output_summary})
+
+                # On failure, inject hints before asking the model again
                 if rc != 0:
                     failed_commands_count[cmd] = failed_commands_count.get(cmd, 0) + 1
                     command_errors[cmd] = (stderr or stdout).strip()
+                    hint = diag_hints_for(cmd, rc, stderr, stdout)
+                    if hint:
+                        messages.append({"role":"system","content": hint})
+
+                messages.append({"role": "user", "content": f"Command: {cmd}\nReturn code: {rc}\nSTDOUT:\n{clip(stdout)}\nSTDERR:\n{clip(stderr)}"})
 
                 new_sig = apt_context_signature()
                 if new_sig != last_apt_sig:
@@ -528,11 +584,12 @@ def main() -> None:
                 finished = True
                 break
 
-            time.sleep(0.5)  # small pause to avoid hammering
+            time.sleep(0.2)
 
         if not finished and step_num >= args.max_steps:
             print("Maximum number of steps reached. The task may not be complete.", flush=True)
 
+    # Cost (approx)
     if total_prompt_tokens or total_completion_tokens:
         pricing = {
             "gpt-4o": {"input": 0.0025, "output": 0.01},
@@ -548,6 +605,22 @@ def main() -> None:
         else:
             print(f"\nToken usage (chat): prompt={total_prompt_tokens}, completion_tokens={total_completion_tokens}.", flush=True)
 
+# ----- APT context signature -----
+def apt_context_signature() -> str:
+    paths = ["/etc/apt/sources.list"]
+    paths.extend(sorted(glob("/etc/apt/sources.list.d/*.list")))
+    paths.extend(sorted(glob("/etc/apt/trusted.gpg.d/*.gpg")))
+    sig_parts = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+            sig_parts.append(f"{p}:{int(st.st_mtime)}:{st.st_size}")
+        except FileNotFoundError:
+            sig_parts.append(f"{p}:absent")
+        except Exception:
+            pass
+    return "|".join(sig_parts)
+
 if __name__ == "__main__":
     main()
 PYCODE
@@ -555,14 +628,15 @@ ${SUDO} chmod 644 "$DEST_DIR/ai_server_agent.py"
 
 echo "[INFO] Writing report to $DEST_DIR/report.md"
 ${SUDO} tee "$DEST_DIR/report.md" >/dev/null <<'REPORTDOC'
-# Agente autónomo Debian con OpenAI (v1.3.6)
-- **Un único prompt de tarea**. La decisión de web-search (Responses API) es transparente y se realiza *una vez* por tarea.
-- **Rápido por defecto**: una llamada Responses (decisión+fetch), Chat Completions con límite de salida y explicaciones concisas.
-- **Evita curls innecesarios**: si hace falta información de Internet, se incorpora como `WEB_CONTEXT`.
-- **Batching** con `bash -lc` cuando hay estado compartido; **guardas** contra comandos peligrosos.
-- **APT** con reintentos contextuales (cuando cambian repos/keys).
-- **TTY robusto**: si no hay TTY, falla de forma explícita en lugar de quedarse “mudo”.
-- **Clave persistente**: `/etc/ai-agent/agent.env` (`--set-key`, `--show-key`, `--clear-key`).
+# Agente autónomo Debian con OpenAI (v1.4.0)
+- Un único prompt de tarea; web-search (Responses) se decide **una vez** y de forma transparente.
+- Salidas concisas; cap compatible con modelos nuevos/antiguos.
+- **Auto-batching** con `bash -lc` cuando se detecta estado compartido.
+- **DIAGNOSTIC_HINTS** ante errores típicos (APT, permisos, DNS, espacio, timeouts).
+- **ENV_SNAPSHOT** y chequeo de red para reducir pasos fallidos.
+- **Ventana deslizante**: resume historial antiguo para mantener coste/latencia.
+- **Guardas** contra comandos destructivos tokenizados.
+- Wrapper con clave persistente y `config.env` para defaults.
 REPORTDOC
 ${SUDO} chmod 644 "$DEST_DIR/report.md"
 
@@ -614,24 +688,15 @@ HLP
 }
 
 mask_key() {
-  local key="$1"
-  local len=${#key}
-  if [ "$len" -le 8 ]; then
-    echo "********"
-  else
-    echo "${key:0:4}********${key: -4}"
-  fi
+  local key="$1"; local len=${#key}
+  if [ "$len" -le 8 ]; then echo "********"; else echo "${key:0:4}********${key: -4}"; fi
 }
 
 cmd_set_key() {
   local new="${1:-}"
   if [ -z "$new" ]; then
-    if [ -t 0 ]; then
-      read -r -s -p "Introduce tu OPENAI_API_KEY: " new
-      echo
-    else
-      echo "[ERROR] No hay TTY y no se proporcionó clave. Usa: ai-agent --set-key TUCLAVE" >&2
-      exit 1
+    if [ -t 0 ]; then read -r -s -p "Introduce tu OPENAI_API_KEY: " new; echo
+    else echo "[ERROR] No hay TTY y no se proporcionó clave. Usa: ai-agent --set-key TUCLAVE" >&2; exit 1
     fi
   fi
   install -m 700 -d /etc/ai-agent
@@ -641,84 +706,44 @@ cmd_set_key() {
 }
 
 cmd_clear_key() {
-  if [ -f "$KEY_FILE" ]; then
-    rm -f "$KEY_FILE"
-    echo "[OK] Clave eliminada de $KEY_FILE"
-  else
-    echo "[INFO] No hay clave persistida."
-  fi
+  if [ -f "$KEY_FILE" ]; then rm -f "$KEY_FILE"; echo "[OK] Clave eliminada de $KEY_FILE"
+  else echo "[INFO] No hay clave persistida."; fi
 }
 
 cmd_show_key() {
-  if [ -f "$KEY_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$KEY_FILE"
-    if [ -n "${OPENAI_API_KEY:-}" ]; then
-      echo "OPENAI_API_KEY=$(mask_key "$OPENAI_API_KEY")"
-    else
-      echo "[WARN] El archivo existe pero no tiene OPENAI_API_KEY."
-    fi
-  else
-    echo "[INFO] No hay clave persistida en $KEY_FILE"
-  fi
+  if [ -f "$KEY_FILE" ]; then . "$KEY_FILE"; if [ -n "${OPENAI_API_KEY:-}" ]; then
+      echo "OPENAI_API_KEY=$(mask_key "$OPENAI_API_KEY")"; else echo "[WARN] El archivo existe pero no tiene OPENAI_API_KEY."; fi
+  else echo "[INFO] No hay clave persistida en $KEY_FILE"; fi
 }
 
-if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-  print_help
-  exit 0
-fi
-
-if [ "${1:-}" = "--help-agent" ]; then
-  exec "$PYTHON_BIN" "$AGENT_SCRIPT" --help
-fi
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then print_help; exit 0; fi
+if [ "${1:-}" = "--help-agent" ]; then exec "$PYTHON_BIN" "$AGENT_SCRIPT" --help; fi
 
 case "${1:-}" in
-  --set-key)
-    shift
-    cmd_set_key "${1:-}"
-    exit 0
-    ;;
-  --clear-key)
-    cmd_clear_key
-    exit 0
-    ;;
-  --show-key)
-    cmd_show_key
-    exit 0
-    ;;
+  --set-key) shift; cmd_set_key "${1:-}"; exit 0 ;;
+  --clear-key) cmd_clear_key; exit 0 ;;
+  --show-key) cmd_show_key; exit 0 ;;
 esac
 
 # Defaults (can be overridden by config/env)
-: "${AI_AGENT_DEFAULT_MODEL:=gpt-5-mini}"
-: "${AI_AGENT_DEFAULT_MAX_STEPS:=24}"
-: "${AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP:=24}"
-: "${AI_AGENT_WEB_MODE:=auto}"
+: "${AI_AGENT_DEFAULT_MODEL:=${AI_AGENT_DEFAULT_MODEL:-gpt-5-mini}}"
+: "${AI_AGENT_DEFAULT_MAX_STEPS:=${AI_AGENT_DEFAULT_MAX_STEPS:-24}}"
+: "${AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP:=${AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP:-24}}"
+: "${AI_AGENT_WEB_MODE:=${AI_AGENT_WEB_MODE:-auto}}"
 
 # Load persistent config if present (overrides the above)
-if [ -r "$CONF_FILE" ]; then
-  # shellcheck disable=SC1090
-  . "$CONF_FILE"
-fi
+if [ -r "$CONF_FILE" ]; then . "$CONF_FILE"; fi
 
 # Try to load persistent key if env is empty
-if [ -z "${OPENAI_API_KEY:-}" ] && [ -r "$KEY_FILE" ]; then
-  # shellcheck disable=SC1090
-  . "$KEY_FILE"
-fi
+if [ -z "${OPENAI_API_KEY:-}" ] && [ -r "$KEY_FILE" ]; then . "$KEY_FILE"; fi
 
-# If still missing and TTY, prompt
+# Prompt for key if still missing
 if [ -z "${OPENAI_API_KEY:-}" ] && [ -t 0 ]; then
-  read -r -s -p "Introduce tu OPENAI_API_KEY: " OPENAI_API_KEY
-  echo
+  read -r -s -p "Introduce tu OPENAI_API_KEY: " OPENAI_API_KEY; echo
   if [ -n "${OPENAI_API_KEY:-}" ]; then
     read -r -p "¿Guardar esta clave en $KEY_FILE para usos futuros? [y/N]: " ans
     case "${ans,,}" in
-      y|yes|s|si|sí)
-        install -m 700 -d /etc/ai-agent
-        umask 077
-        printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" > "$KEY_FILE"
-        echo "[OK] Clave guardada."
-        ;;
+      y|yes|s|si|sí) install -m 700 -d /etc/ai-agent; umask 077; printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" > "$KEY_FILE"; echo "[OK] Clave guardada." ;;
       *) ;;
     esac
   fi
@@ -729,13 +754,8 @@ if [ -z "${OPENAI_API_KEY:-}" ]; then
   exit 1
 fi
 
-# Ensure unbuffered output from Python
 export PYTHONUNBUFFERED=1
-
-# Optional debug
-if [ "${AI_AGENT_DEBUG:-0}" != "0" ]; then
-  set -x
-fi
+if [ "${AI_AGENT_DEBUG:-0}" != "0" ]; then set -x; fi
 
 exec env AI_AGENT_DEFAULT_MODEL="$AI_AGENT_DEFAULT_MODEL" \
         AI_AGENT_DEFAULT_MAX_STEPS="$AI_AGENT_DEFAULT_MAX_STEPS" \
@@ -752,8 +772,7 @@ if [ -t 0 ]; then
   read -r -p "¿Quieres guardar ahora tu OPENAI_API_KEY para futuros usos? [y/N]: " WANT_SAVE
   case "${WANT_SAVE,,}" in
     y|yes|s|si|sí)
-      read -r -s -p "Introduce tu OPENAI_API_KEY: " K
-      echo
+      read -r -s -p "Introduce tu OPENAI_API_KEY: " K; echo
       if [ -n "${K:-}" ]; then
         ${SUDO} install -m 700 -d /etc/ai-agent
         umask 077
@@ -767,4 +786,4 @@ if [ -t 0 ]; then
   esac
 fi
 
-printf "\nListo. Prueba ahora:\n  ai-agent --help-agent\n  ai-agent --task \"muestra 'uname -a' y 'lsb_release -a'\" \n"
+printf "\nListo. Prueba ahora:\n  ai-agent --help-agent\n  ai-agent --task \"muestra 'uname -a' y 'lsb_release -a'\"\n"
