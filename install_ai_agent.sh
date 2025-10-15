@@ -58,7 +58,7 @@ self_update() {
     return 0
   fi
   local remote_ver
-  remote_ver="$(grep -E '^VERSION=\"' \"$tmp\" | head -n1 | sed -E 's/^VERSION=\"([^\"]+)\".*/\1/')"
+  remote_ver="$(grep -E '^VERSION=\"' $tmp | head -n1 | sed -E 's/^VERSION=\"([^\"]+)\".*/\1/')"
   if [ -z "$remote_ver" ]; then
     warn "Remote installer has no VERSION; skipping self-update."
     rm -f "$tmp" || true
