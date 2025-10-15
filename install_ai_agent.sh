@@ -44,7 +44,7 @@ if command -v flock >/dev/null 2>&1; then
 fi
 
 # Versioning and update mechanism
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 # Set UPDATE_URL to the address of the latest install script.  Leave empty to disable auto-update.
 # Example:
 # UPDATE_URL="https://example.com/install_ai_agent.sh"
@@ -69,7 +69,6 @@ fi
 if [ -n "$UPDATE_URL" ]; then
     if command -v curl >/dev/null 2>&1; then
         tmp_update_file="$(mktemp)"
-        # ensure cleanup
         cleanup_update_tmp() { rm -f "$tmp_update_file"; }
         trap cleanup_update_tmp EXIT
         if curl -fsSL "$UPDATE_URL" -o "$tmp_update_file"; then
@@ -79,7 +78,6 @@ if [ -n "$UPDATE_URL" ]; then
                 if [ "$newest_version" = "$remote_version" ] && [ "$SCRIPT_VERSION" != "$remote_version" ]; then
                     echo "[INFO] A newer version ($remote_version) is available at $UPDATE_URL. Updating..."
                     script_path="$(readlink -f -- "$0")"
-                    # Atomic replace with correct mode
                     ${SUDO} install -m 755 "$tmp_update_file" "$script_path"
                     echo "[INFO] Executing the updated script..."
                     exec "$script_path" "$@"
@@ -88,7 +86,6 @@ if [ -n "$UPDATE_URL" ]; then
         else
             echo "[WARN] Unable to check for updates at $UPDATE_URL. Proceeding with current version."
         fi
-        # tmp file auto-cleaned by trap
     else
         echo "[WARN] UPDATE_URL definido pero 'curl' no está disponible; omito auto-actualización."
     fi
@@ -268,20 +265,16 @@ def call_chat_json(messages: List[Dict[str, str]], model: str) -> Tuple[Dict[str
     return data, usage_dict
 
 
-# ===== One-off web search (Responses API) =====
+# ===== Responses API Web Search (one-off per task) =====
 def responses_available() -> bool:
     try:
         client = OpenAI()
-        _ = client.responses  # attribute exists on modern SDK
+        _ = client.responses
         return True
     except Exception:
         return False
 
 def responses_web_search(text: str, model: str, allow_tools: bool) -> Tuple[str, str]:
-    """
-    Execute a single Responses call. If allow_tools is True, we pass the web_search tool;
-    otherwise we call without tools. Returns (output_text, error_or_empty).
-    """
     client = OpenAI()
     tools = [{"type": "web_search"}] if allow_tools else None
     try:
@@ -291,14 +284,13 @@ def responses_web_search(text: str, model: str, allow_tools: bool) -> Tuple[str,
             resp = client.responses.create(model=model, input=text, tools=tools)
     except Exception as e:
         return "", f"{e}"
-    # extract text robustly across SDK versions
     out = getattr(resp, "output_text", None)
     if not out:
-        # Try to assemble from 'output' field if present
         try:
             out = getattr(resp, "output", None)
             if out is not None:
-                out = json.dumps(out, default=lambda o: getattr(o, "__dict__", str(o)))
+                import json as _json
+                out = _json.dumps(out, default=lambda o: getattr(o, "__dict__", str(o)))
             else:
                 out = str(resp)
         except Exception:
@@ -307,17 +299,10 @@ def responses_web_search(text: str, model: str, allow_tools: bool) -> Tuple[str,
 
 
 def web_autoplan(task: str, model: str, mode: str) -> str:
-    """
-    Decide once per task whether to fetch web context, then (optionally) fetch it.
-    Returns a textual summary (with citations if provided) to inject into conversation,
-    or an empty string when skipping.
-    """
     if mode == "off":
         return ""
     if not responses_available():
         return ""
-    # Some models may not support web_search; we detect via attempting a short call.
-    # First, in 'auto' ask the model to decide (with the tool available).
     if mode == "auto":
         decision_prompt = (
             "You are deciding whether a web search is needed to accomplish the following server task.\n"
@@ -327,21 +312,16 @@ def web_autoplan(task: str, model: str, mode: str) -> str:
         )
         text, err = responses_web_search(decision_prompt, model, allow_tools=True)
         if err:
-            return ""  # silently fallback
+            return ""
         try:
-            # Extract JSON from text
             start = text.find("{")
             end = text.rfind("}") + 1
-            obj = json.loads(text[start:end])
-            if not isinstance(obj, dict):
-                return ""
-            need_web = bool(obj.get("need_web", False))
-            if not need_web:
+            import json as _json
+            obj = _json.loads(text[start:end])
+            if not isinstance(obj, dict) or not obj.get("need_web"):
                 return ""
         except Exception:
-            # If model didn't follow schema, just skip to be safe
             return ""
-        # If we get here, do one web-enabled call on the original task asking for a concise context
         fetch_prompt = (
             "Briefly (<= 2000 chars) gather up-to-date context and key URLs needed to perform the following server task. "
             "Focus on official docs, commands, and compatibility notes. Return a compact summary with inline sources:\n\n"
@@ -351,7 +331,7 @@ def web_autoplan(task: str, model: str, mode: str) -> str:
         if err2:
             return ""
         return out or ""
-    else:  # mode == "on"
+    else:  # on
         fetch_prompt = (
             "Briefly (<= 2000 chars) gather up-to-date context and key URLs needed to perform the following server task. "
             "Focus on official docs, commands, and compatibility notes. Return a compact summary with inline sources:\n\n"
@@ -375,7 +355,6 @@ def log(msg: str, log_file: str = "") -> None:
             pass
 
 
-# --- Context tracking for APT ---
 def apt_context_signature() -> str:
     paths = ["/etc/apt/sources.list"]
     paths += sorted(glob("/etc/apt/sources.list.d/*.list"))
@@ -384,7 +363,7 @@ def apt_context_signature() -> str:
     for p in paths:
         try:
             st = os.stat(p)
-            sig_parts.append(f"{p}:{int(st.st_mtime)}:{st.st_size}")
+            sig_parts.append(f"{p}:{int(st.st_mtime)}}:{st.st_size}")
         except FileNotFoundError:
             sig_parts.append(f"{p}:absent")
         except Exception:
@@ -396,19 +375,14 @@ RETRY_WHITELIST = {"apt-get update", "apt update", "apt-get -f install", "apt -f
 
 
 def should_batch(commands: List[str]) -> bool:
-    """Heuristic: batch if sequence seems to rely on shared state or uses set -e/var assignments."""
     if len(commands) <= 1:
         return False
     text = "\n".join(commands)
-    hints = [
-        "set -e", "set -o pipefail", ". /etc/os-release", "source /etc/os-release",
-        "export ", "VERSION_ID=", "CODENAME=", "&&", ";",
-    ]
+    hints = ["set -e", "set -o pipefail", ". /etc/os-release", "source /etc/os-release", "export ", "VERSION_ID=", "CODENAME=", "&&", ";"]
     return any(h in text for h in hints)
 
 
 def run_batch(commands: List[str], timeout: int) -> Tuple[int, str, str]:
-    """Run a list of commands in a single bash -lc session if safe."""
     for line in commands:
         if is_really_dangerous(line):
             return 2, "", f"Refused to batch due to dangerous line: {line}"
@@ -417,9 +391,7 @@ def run_batch(commands: List[str], timeout: int) -> Tuple[int, str, str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=("Autonomous server agent: turns natural language into shell commands on Debian.")
-    )
+    parser = argparse.ArgumentParser(description=("Autonomous server agent: turns natural language into shell commands on Debian."))
     parser.add_argument("--task", type=str, help="Initial instruction for the agent.")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help=f"OpenAI model to use (default from env or '{DEFAULT_MODEL}').")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Max reasoning cycles per task.")
@@ -439,10 +411,10 @@ def main() -> None:
     messages: List[Dict[str, str]] = []
     messages.append({"role": "system", "content": build_system_prompt()})
 
-    # One-off web context (auto/on) — do this once at the start of the task
+    # One-off web context
     from typing import Optional
     pending_task: Optional[str] = args.task if args.task else None
-    intro_task = pending_task  # stash for pre-web probe
+    intro_task = pending_task
     if intro_task is None:
         try:
             intro_task = input("Enter initial task to decide web-search (press Enter to skip): ").strip() or None
@@ -451,21 +423,16 @@ def main() -> None:
     if intro_task:
         web_context = web_autoplan(intro_task, args.model, args.web)
         if web_context:
-            messages.append({
-                "role": "system",
-                "content": "WEB_CONTEXT (one-off):\n" + clip(web_context, 8000)
-            })
+            messages.append({"role": "system", "content": "WEB_CONTEXT (one-off):\n" + clip(web_context, 8000)})
 
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    # Track APT context to allow retries of apt-get update when it actually changed
     last_apt_sig = apt_context_signature()
     failed_commands_count: Dict[str, int] = {}
     command_errors: Dict[str, str] = {}
 
     while True:
-        # Get next task
         if pending_task is not None:
             user_task = pending_task.strip()
             pending_task = None
@@ -510,9 +477,9 @@ def main() -> None:
                 finished = True
                 break
 
-            # Respect command limit
             if len(commands) > args.max_commands_per_step:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Limiting commands from {len(commands)} to {args.max_commands_per_step}")
+                echo_ts="$(date +'%Y-%m-%d %H:%M:%S')"
+                print(f"[{echo_ts}] Limiting commands from {len(commands)} to {args.max_commands_per_step}")
                 commands = commands[: args.max_commands_per_step]
 
             print(f"\n=== Step {step_num} ===")
@@ -524,8 +491,8 @@ def main() -> None:
             else:
                 print("No commands proposed.")
 
-            # Batching heuristic
             used_batch = False
+
             def execute_and_feedback(rc: int, stdout: str, stderr: str, cmd_desc: str):
                 if stdout:
                     print("-- STDOUT --")
@@ -538,7 +505,6 @@ def main() -> None:
                 messages.append({"role": "user", "content": summary})
 
             if len(commands) > 1 and any(h in "\n".join(commands) for h in ("set -e", ". /etc/", "source /etc", "export ", "&&", ";")):
-                # Batch if safe
                 if args.confirm:
                     ans = input("Se propone ejecutar en un único bash -lc. ¿Continuar? [y/N]: ").strip().lower()
                     if ans not in {"y","yes","s","si","sí"}:
@@ -558,14 +524,10 @@ def main() -> None:
                         rc, out, err = run_shell_command(f"bash -lc {shlex.quote(script)}", timeout=args.timeout)
                         used_batch = True
                         execute_and_feedback(rc, out, err, "BATCH EXECUTION")
-                        if rc != 0:
-                            # Continue loop to let model react
-                            pass
 
             if not used_batch:
                 skip_remaining = False
                 for idx, cmd in enumerate(commands, start=1):
-                    # Context-aware retry logic
                     allow_retry = any(cmd.strip().startswith(k) for k in RETRY_WHITELIST)
                     previously_failed = cmd in failed_commands_count
                     apt_sig_now = apt_context_signature()
@@ -629,7 +591,6 @@ def main() -> None:
         if not finished and step_num >= args.max_steps:
             print("Maximum number of steps reached. The task may not be complete.")
 
-    # Token/cost report (best-effort, not including Responses API calls)
     if total_prompt_tokens or total_completion_tokens:
         pricing = {
             "gpt-4o": {"input": 0.0025, "output": 0.01},
@@ -640,39 +601,26 @@ def main() -> None:
         if model_key in pricing:
             rates = pricing[model_key]
             cost = (total_prompt_tokens * rates["input"] + total_completion_tokens * rates["output"]) / 1000.0
-            print(
-                f"\nApproximate API usage (chat): prompt_tokens={total_prompt_tokens}, "
-                f"completion_tokens={total_completion_tokens}."
-            )
+            print(f"\nApproximate API usage (chat): prompt_tokens={total_prompt_tokens}, completion_tokens={total_completion_tokens}.")
             print(f"Estimated cost for model '{args.model}': ${cost:.4f} (USD)")
         else:
-            print(
-                f"\nToken usage (chat): prompt={total_prompt_tokens}, completion={total_completion_tokens}. "
-                f"Cost calculation not implemented for model '{args.model}'."
-            )
-
-
-if __name__ == "__main__":
-    main()
+            print(f"\nToken usage (chat): prompt={total_prompt_tokens}, completion={total_completion_tokens}. Cost calc not implemented.")
 PYCODE
-
 ${SUDO} chmod 644 "$DEST_DIR/ai_server_agent.py"
 
-# Write the report file alongside the agent for reference
+# Report
 echo "[INFO] Writing report to $DEST_DIR/report.md"
 ${SUDO} tee "$DEST_DIR/report.md" >/dev/null <<'REPORTDOC'
-# Agente autónomo para administrar un servidor Debian con OpenAI (versión con web auto)
+# Agente autónomo para administrar un servidor Debian con OpenAI (web auto + hardening)
 
-**Novedades generales (independientes de una tarea concreta):**
-- **Web “auto”** (Responses API): el agente decide **al inicio** de cada tarea si conviene hacer *una* búsqueda web (y la hace). Bandera `--web auto|on|off`.
-- **Caída elegante**: si el modelo/SDK no soporta `web_search`, se omite y sigue offline.
-- **Batching seguro** para pasos que comparten estado (variables, `set -e`, `source`).
-- **Detección de comandos peligrosos** tokenizada (evita falsos positivos de limpiezas sanas).
-- **Reintentos con contexto APT** (permite reintentar `apt-get update` si cambian repos/llaves).
-- **Límites elevados por defecto** para casos largos (24 pasos / 24 comandos por paso).
-- **Modelo y modo web por defecto configurables** por variables de entorno exportadas por el wrapper.
+- **Web “auto”** (Responses API): `--web auto|on|off` (por defecto `auto`), decisión una sola vez por tarea.
+- **Fallback** si la API o el modelo no soportan web_search.
+- **Batching seguro**, **detector de comandos peligrosos** tokenizado,
+- **Reintentos APT** contextuales,
+- **Límites por defecto altos** (24/24),
+- **Modelo y modo web** configurables vía entorno.
 
-Consulta el script para detalles y opciones.
+Consulta el script para detalles.
 REPORTDOC
 ${SUDO} chmod 644 "$DEST_DIR/report.md"
 
@@ -688,25 +636,29 @@ echo "[INFO] Installing Python dependencies into the virtual environment..."
 ${SUDO} "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
 ${SUDO} "$VENV_DIR/bin/pip" install --no-cache-dir 'openai>=1.60,<2' >/dev/null
 
-# Create a wrapper executable in /usr/local/bin
+# Create a wrapper executable in /usr/local/bin (single-quoted heredoc to avoid expansion now)
 WRAPPER="/usr/local/bin/ai-agent"
 echo "[INFO] Creating wrapper executable $WRAPPER"
-${SUDO} tee "$WRAPPER" >/dev/null <<EOF
+${SUDO} tee "$WRAPPER" >/dev/null <<'EOF'
 #!/bin/bash
 # Wrapper for launching the AI server agent
 
+# Fail fast on errors
+set -euo pipefail
+
 # Ensure the OpenAI API key is provided via environment variable
-if [ -z "\${OPENAI_API_KEY:-}" ]; then
+if [ -z "${OPENAI_API_KEY:-}" ]; then
     echo "Error: OPENAI_API_KEY environment variable is not set." >&2
     echo "Please export your OpenAI API key before running this command." >&2
     exit 1
 fi
 
-# Default model, limits and web mode (can be overridden by environment)
-: "\${AI_AGENT_DEFAULT_MODEL:=${DEFAULT_MODEL}}"
-: "\${AI_AGENT_DEFAULT_MAX_STEPS:=${DEFAULT_MAX_STEPS}}"
-: "\${AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP:=${DEFAULT_MAX_CMDS_PER_STEP}}"
-: "\${AI_AGENT_WEB_MODE:=${DEFAULT_WEB_MODE}}"
+# Default model, limits and web mode (can be overridden by environment).
+# We bake literal defaults here to avoid relying on installer variables.
+: "${AI_AGENT_DEFAULT_MODEL:=gpt-5-mini}"
+: "${AI_AGENT_DEFAULT_MAX_STEPS:=24}"
+: "${AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP:=24}"
+: "${AI_AGENT_WEB_MODE:=auto}"
 
 # Fixed paths for the agent installation
 AGENT_DIR="/opt/ai-agent"
@@ -714,11 +666,11 @@ VENV_DIR="$AGENT_DIR/venv"
 PYTHON_BIN="$VENV_DIR/bin/python"
 AGENT_SCRIPT="$AGENT_DIR/ai_server_agent.py"
 
-exec env AI_AGENT_DEFAULT_MODEL="\$AI_AGENT_DEFAULT_MODEL" \
-        AI_AGENT_DEFAULT_MAX_STEPS="\$AI_AGENT_DEFAULT_MAX_STEPS" \
-        AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP="\$AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP" \
-        AI_AGENT_WEB_MODE="\$AI_AGENT_WEB_MODE" \
-    "\$PYTHON_BIN" "\$AGENT_SCRIPT" "\$@"
+exec env AI_AGENT_DEFAULT_MODEL="$AI_AGENT_DEFAULT_MODEL" \
+        AI_AGENT_DEFAULT_MAX_STEPS="$AI_AGENT_DEFAULT_MAX_STEPS" \
+        AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP="$AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP" \
+        AI_AGENT_WEB_MODE="$AI_AGENT_WEB_MODE" \
+    "$PYTHON_BIN" "$AGENT_SCRIPT" "$@"
 EOF
 ${SUDO} chmod +x "$WRAPPER"
 
@@ -730,7 +682,6 @@ echo
 if [ -n "$API_KEY_INPUT" ]; then
     export OPENAI_API_KEY="$API_KEY_INPUT"
     echo "[INFO] Ejecutando el agente interactivo..."
-    # Forward any additional args to the Python program.
     AI_AGENT_DEFAULT_MODEL="$DEFAULT_MODEL" \
     AI_AGENT_DEFAULT_MAX_STEPS="$DEFAULT_MAX_STEPS" \
     AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP="$DEFAULT_MAX_CMDS_PER_STEP" \
@@ -738,6 +689,6 @@ if [ -n "$API_KEY_INPUT" ]; then
       "$VENV_DIR/bin/python" "$DEST_DIR/ai_server_agent.py" "$@"
 else
     printf "No se ha introducido ninguna clave; la instalación ha finalizado sin ejecutar el agente.\n"
-    printf "Para utilizar el agente más adelante:\n  export OPENAI_API_KEY=<tu-clave>\n  AI_AGENT_WEB_MODE=%s AI_AGENT_DEFAULT_MODEL=%s ai-agent --task \"tu instrucción\"\n" "$DEFAULT_WEB_MODE" "$DEFAULT_MODEL"
+    printf "Para utilizar el agente más adelante:\n  export OPENAI_API_KEY=<tu-clave>\n  ai-agent --task \"tu instrucción\"\n"
 fi
 printf "\nPuedes volver a ejecutar este script para actualizar el agente, reescribir el informe o introducir una nueva clave de API.\n"
