@@ -11,7 +11,7 @@ set -Eeuo pipefail
 # =========================
 #  Versioning / Auto-update
 # =========================
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.6.0"
 UPDATE_URL="https://raw.githubusercontent.com/Halk58/ai-agent-cli/main/install_ai_agent.sh"
 
 if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
