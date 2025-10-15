@@ -19,7 +19,7 @@ set -euo pipefail
 ###############################################################################
 # Versionado y auto-update del instalador
 ###############################################################################
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 # Usa tu URL de actualización
 UPDATE_URL="https://raw.githubusercontent.com/Halk58/ai-agent-cli/main/install_ai_agent.sh"
 
