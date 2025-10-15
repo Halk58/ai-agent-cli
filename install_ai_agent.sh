@@ -136,41 +136,122 @@ def _api_call(messages: List[Dict[str, str]], model: str, max_out_tokens: int, u
         kwargs["max_tokens"] = max_out_tokens
     return openai.chat.completions.create(**kwargs)
 
+# --- reemplaza todo lo que tengas de call_openai_chat y helpers por esto ---
+
+def _chat_call(messages, model, max_out_tokens, use_mct=True, use_temp=None):
+    kwargs = {"model": model, "messages": messages, "response_format": {"type": "json_object"}}
+    if use_temp is not None:
+        kwargs["temperature"] = use_temp
+    if use_mct:
+        kwargs["max_completion_tokens"] = max_out_tokens
+    else:
+        kwargs["max_tokens"] = max_out_tokens
+    return openai.chat.completions.create(**kwargs)
+
+def _responses_call(messages, model, max_out_tokens, prefer_mct=True, use_temp=None):
+    # Responses API: admite 'input' con mensajes estilo chat
+    # Algunos despliegues usan 'max_output_tokens'; otros aceptan 'max_completion_tokens'.
+    try:
+        from openai import OpenAI  # type: ignore
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    except Exception:
+        raise RuntimeError("Responses API client no disponible en esta instalación de openai.")
+    base = {"model": model, "input": messages, "response_format": {"type": "json_object"}}
+    if use_temp is not None:
+        base["temperature"] = use_temp
+    # Primero intentamos con max_completion_tokens, luego con max_output_tokens, y por último sin límite explícito.
+    try:
+        resp = client.responses.create(**{**base, "max_completion_tokens": max_out_tokens})
+        return resp
+    except Exception as e1:
+        emsg = str(e1)
+        if "max_completion_tokens" in emsg:
+            try:
+                resp = client.responses.create(**{**base, "max_output_tokens": max_out_tokens})
+                return resp
+            except Exception as e2:
+                # último intento sin límite explícito
+                resp = client.responses.create(**base)
+                return resp
+        # si el fallo no es por el nombre del parámetro, reintenta sin límite
+        resp = client.responses.create(**base)
+        return resp
+
 def call_openai_chat(messages: List[Dict[str, str]], model: str, max_out_tokens: int = 2048) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """
-    Intenta en este orden:
-      1) temperature=0.0 + max_completion_tokens
-      2) sin temperature + max_completion_tokens
-      3) temperature=0.0 + max_tokens
-      4) sin temperature + max_tokens
-    Con backoff suave entre intentos.
+    Estrategia:
+      A) Chat Completions con JSON y max_completion_tokens (sin temperature)
+      B) Si error dice 'use Responses API' -> cambiar a Responses API (sin temperature)
+      C) Si error dice que 'max_completion_tokens' no existe -> usar max_tokens (Chat)
+      D) Si error dice que 'temperature' no es soportado -> reintentar sin temperature
     """
-    attempts = [
-        (0.0, True),
-        (None, True),
-        (0.0, False),
-        (None, False),
-    ]
-    last_exc: Optional[Exception] = None
-    for i, (temp, use_mct) in enumerate(attempts, start=1):
+    # A) Chat + mct sin temperature
+    try:
+        resp = _chat_call(messages, model, max_out_tokens, use_mct=True, use_temp=None)
+        content = resp.choices[0].message.content
+        data = json.loads(content)
+        usage = getattr(resp, "usage", None)
+        usage_dict = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens} if usage else {"prompt_tokens":0,"completion_tokens":0}
+        return data, usage_dict
+    except Exception as e:
+        emsg = str(e)
+        # ¿Pide Responses API?
+        if "Responses API" in emsg or "use the Responses API" in emsg or "not supported with the Chat Completions API" in emsg:
+            try:
+                r = _responses_call(messages, model, max_out_tokens, prefer_mct=True, use_temp=None)
+                # Responses API: extraer texto
+                try:
+                    # SDK nuevo
+                    content = r.output_text
+                except Exception:
+                    # fallback: navegar en la estructura
+                    content = r.choices[0].message["content"][0]["text"]
+                data = json.loads(content)
+                usage = getattr(r, "usage", None)
+                usage_dict = {"prompt_tokens": getattr(usage, "prompt_tokens", 0), "completion_tokens": getattr(usage, "completion_tokens", 0)} if usage else {"prompt_tokens":0,"completion_tokens":0}
+                return data, usage_dict
+            except Exception as e2:
+                emsg2 = str(e2)
+                # Si el problema fuera temperature, reintenta Responses sin temperature (ya lo hicimos)
+                raise RuntimeError(f"OpenAI API (Responses) error: {emsg2}") from e2
+
+        # ¿No soporta temperature? (aunque aquí no lo enviamos, lo cubrimos por si el modelo se queja)
+        if "temperature" in emsg and ("unsupported" in emsg.lower() or "does not support" in emsg.lower()):
+            try:
+                resp = _chat_call(messages, model, max_out_tokens, use_mct=True, use_temp=None)
+                content = resp.choices[0].message.content
+                data = json.loads(content)
+                usage = getattr(resp, "usage", None)
+                usage_dict = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens} if usage else {"prompt_tokens":0,"completion_tokens":0}
+                return data, usage_dict
+            except Exception as e3:
+                emsg = str(e3)  # continúa abajo
+
+        # ¿Rechaza max_completion_tokens? solo entonces intentar con max_tokens
+        if "max_completion_tokens" in emsg and ("Unsupported" in emsg or "unsupported" in emsg or "parameter" in emsg.lower()):
+            try:
+                resp = _chat_call(messages, model, max_out_tokens, use_mct=False, use_temp=None)
+                content = resp.choices[0].message.content
+                data = json.loads(content)
+                usage = getattr(resp, "usage", None)
+                usage_dict = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens} if usage else {"prompt_tokens":0,"completion_tokens":0}
+                return data, usage_dict
+            except Exception as e4:
+                raise RuntimeError(f"OpenAI API call failed: {e4}") from e4
+
+        # Último recurso: intenta Responses API (por si el mensaje no mencionó “Responses API” de forma literal)
         try:
-            resp = _api_call(messages, model, max_out_tokens, temp, use_mct)
-            content = resp.choices[0].message.content
+            r = _responses_call(messages, model, max_out_tokens, prefer_mct=True, use_temp=None)
+            try:
+                content = r.output_text
+            except Exception:
+                content = r.choices[0].message["content"][0]["text"]
             data = json.loads(content)
-            usage = getattr(resp, "usage", None)
-            usage_dict = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens} if usage else {"prompt_tokens":0, "completion_tokens":0}
+            usage = getattr(r, "usage", None)
+            usage_dict = {"prompt_tokens": getattr(usage, "prompt_tokens", 0), "completion_tokens": getattr(usage, "completion_tokens", 0)} if usage else {"prompt_tokens":0,"completion_tokens":0}
             return data, usage_dict
-        except Exception as e:
-            emsg = str(e)
-            # Si el fallo es por "unsupported parameter/value" avanzamos al siguiente intento
-            if any(k in emsg for k in ["Unsupported parameter", "unsupported_parameter", "Unsupported value", "unsupported value", "does not support"]):
-                last_exc = e
-                time.sleep(0.5 * i)
-                continue
-            # Otros errores: reintenta leve, luego abandona
-            last_exc = e
-            time.sleep(0.4 * i)
-    raise RuntimeError(f"OpenAI API call failed: {last_exc}")
+        except Exception as e5:
+            raise RuntimeError(f"OpenAI API call failed: {e5}") from e5
 
 # -------- Peligros y sanitización --------
 DANGEROUS_PATTERNS = [
