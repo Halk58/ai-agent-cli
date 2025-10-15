@@ -44,14 +44,12 @@ if command -v flock >/dev/null 2>&1; then
 fi
 
 # Versioning and update mechanism
-SCRIPT_VERSION="1.3.1"
-# Set UPDATE_URL to the address of the latest install script.  Leave empty to disable auto-update.
-# Example:
-# UPDATE_URL="https://example.com/install_ai_agent.sh"
+SCRIPT_VERSION="1.3.2"
+# Auto-update points to your published script URL
 UPDATE_URL="https://raw.githubusercontent.com/Halk58/ai-agent-cli/main/install_ai_agent.sh"
 
 # Determine whether sudo is available.  Some minimal containers do not have sudo installed.
-if command -v sudo >/dev/null 2>&1; then
+if command -v sudo >/devnull 2>&1; then
     SUDO="sudo"
 else
     SUDO=""
@@ -71,20 +69,24 @@ if [ -n "$UPDATE_URL" ]; then
         tmp_update_file="$(mktemp)"
         cleanup_update_tmp() { rm -f "$tmp_update_file"; }
         trap cleanup_update_tmp EXIT
-        if curl -fsSL "$UPDATE_URL" -o "$tmp_update_file"; then
-            remote_version="$(grep -Eo 'SCRIPT_VERSION=\"[0-9.]+\"' "$tmp_update_file" | head -n1 | cut -d'"' -f2)"
+        # Add no-cache header and short timeout to avoid stale caches
+        if curl -fsSL --connect-timeout 5 -m 15 -H 'Cache-Control: no-cache' "$UPDATE_URL" -o "$tmp_update_file"; then
+            # Extract remote version from the downloaded file
+            remote_version="$(grep -Eo 'SCRIPT_VERSION=\"?[0-9]+\.[0-9]+\.[0-9]+\"?' "$tmp_update_file" | head -n1 | grep -Eo '([0-9]+\.){2}[0-9]+')"
             if [ -n "$remote_version" ]; then
                 newest_version="$(printf '%s\n%s' "$SCRIPT_VERSION" "$remote_version" | sort -V | tail -n1)"
                 if [ "$newest_version" = "$remote_version" ] && [ "$SCRIPT_VERSION" != "$remote_version" ]; then
-                    echo "[INFO] A newer version ($remote_version) is available at $UPDATE_URL. Updating..."
+                    echo "[INFO] A newer version ($remote_version) is available. Updating self from $UPDATE_URL ..."
                     script_path="$(readlink -f -- "$0")"
                     ${SUDO} install -m 755 "$tmp_update_file" "$script_path"
-                    echo "[INFO] Executing the updated script..."
+                    echo "[INFO] Re-executing the updated installer..."
                     exec "$script_path" "$@"
                 fi
+            else
+                echo "[WARN] No pude extraer SCRIPT_VERSION del archivo remoto."
             fi
         else
-            echo "[WARN] Unable to check for updates at $UPDATE_URL. Proceeding with current version."
+            echo "[WARN] No se pudo descargar $UPDATE_URL. Continuo con la versión local."
         fi
     else
         echo "[WARN] UPDATE_URL definido pero 'curl' no está disponible; omito auto-actualización."
@@ -169,7 +171,7 @@ def run_shell_command(command: str, timeout: int = 900) -> Tuple[int, str, str]:
 
 # --- Dangerous command detection (tokenized) ---
 SAFE_RM_PATTERNS = {
-    "/var/lib/apt/lists/*",  # apt cache cleanup
+    "/var/lib/apt/lists/*",  # apt cache cleanup (allowed)
 }
 
 def _tokenize(cmd: str) -> List[str]:
@@ -356,6 +358,7 @@ def log(msg: str, log_file: str = "") -> None:
 
 
 def apt_context_signature() -> str:
+    """Signature of APT context; changes when sources/keys change (used for smart retries)."""
     paths = ["/etc/apt/sources.list"]
     paths += sorted(glob("/etc/apt/sources.list.d/*.list"))
     paths += sorted(glob("/etc/apt/trusted.gpg.d/*.gpg"))
@@ -363,7 +366,8 @@ def apt_context_signature() -> str:
     for p in paths:
         try:
             st = os.stat(p)
-            sig_parts.append(f"{p}:{int(st.st_mtime)}}:{st.st_size}")
+            # FIX: remove stray '}' in f-string
+            sig_parts.append(f"{p}:{int(st.st_mtime)}:{st.st_size}")
         except FileNotFoundError:
             sig_parts.append(f"{p}:absent")
         except Exception:
@@ -478,8 +482,7 @@ def main() -> None:
                 break
 
             if len(commands) > args.max_commands_per_step:
-                echo_ts="$(date +'%Y-%m-%d %H:%M:%S')"
-                print(f"[{echo_ts}] Limiting commands from {len(commands)} to {args.max_commands_per_step}")
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Limiting commands from {len(commands)} to {args.max_commands_per_step}")
                 commands = commands[: args.max_commands_per_step]
 
             print(f"\n=== Step {step_num} ===")
@@ -654,7 +657,7 @@ if [ -z "${OPENAI_API_KEY:-}" ]; then
 fi
 
 # Default model, limits and web mode (can be overridden by environment).
-# We bake literal defaults here to avoid relying on installer variables.
+# Defaults baked in here to avoid relying on installer variables.
 : "${AI_AGENT_DEFAULT_MODEL:=gpt-5-mini}"
 : "${AI_AGENT_DEFAULT_MAX_STEPS:=24}"
 : "${AI_AGENT_DEFAULT_MAX_CMDS_PER_STEP:=24}"
